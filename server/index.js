@@ -287,14 +287,21 @@ app.get('/api/sync/load/:userId', async (req, res) => {
 const start = async () => {
     try {
         console.log("⏳ Inicializando YouTube Music...");
-        await ytmusic.initialize();
-        console.log("✅ Motor de YouTube Music listo");
-        
+        // Le damos un tiempo límite a la inicialización
+        await Promise.race([
+            ytmusic.initialize(),
+            new Promise((_, reject) => setTimeout(() => reject(new Error("Timeout YT")), 5000))
+        ]).catch(err => console.warn("⚠️ YT Music no pudo iniciar, pero el servidor seguirá arrancando."));
+
         app.listen(PORT, () => {
             console.log(`🚀 Servidor Klang activo en http://localhost:${PORT}`);
         });
     } catch (err) {
-        console.error("❌ Fallo al iniciar el servidor:", err);
+        // Obligamos al servidor a arrancar aunque haya errores críticos
+        console.error("❌ Error durante el inicio, forzando arranque local:", err);
+        app.listen(PORT, () => {
+            console.log(`🚀 Servidor Klang arrancado en MODO EMERGENCIA (Puerto ${PORT})`);
+        });
     }
 };
 

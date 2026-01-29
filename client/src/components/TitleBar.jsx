@@ -7,7 +7,15 @@ const TitleBar = ({ onToggleSocial, isSocialOpen }) => {
   const { searchQuery, setSearchQuery } = usePlayer();
 
   const handleControl = (action) => {
-    if (window.electronAPI) window.electronAPI.controlWindow(action);
+    // Intentamos acceder a ipcRenderer de las dos formas posibles en Electron
+    const ipc = window.ipcRenderer || (window.require && window.require('electron').ipcRenderer);
+
+    if (ipc) {
+      console.log("Enviando acción a Electron:", action);
+      ipc.send(action);
+    } else {
+      console.warn("No se detectó el entorno de Electron para:", action);
+    }
   };
 
   const BAR_HEIGHT = '55px';
@@ -76,9 +84,9 @@ const TitleBar = ({ onToggleSocial, isSocialOpen }) => {
         
         <div style={{ width: '10px', height: '100%' }} />
 
-        <button className="titlebar-button btn-wide" onClick={() => handleControl('minimize')}><Minus size={20}/></button>
-        <button className="titlebar-button btn-wide" onClick={() => handleControl('maximize')}><Square size={14}/></button>
-        <button className="titlebar-button btn-wide btn-close" onClick={() => handleControl('close')}><X size={20}/></button>
+        <button className="titlebar-button btn-wide" onClick={() => handleControl('window-minimize')}><Minus size={20}/></button>
+        <button className="titlebar-button btn-wide" onClick={() => handleControl('window-maximize')}><Square size={14}/></button>
+        <button className="titlebar-button btn-wide btn-close" onClick={() => handleControl('window-close')}><X size={20}/></button>
       </div>
 
       <style>{`

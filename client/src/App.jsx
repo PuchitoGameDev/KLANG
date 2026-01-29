@@ -15,110 +15,124 @@ import QueueDrawer from './components/QueueDrawer';
 
 const ADMIN_EMAIL = "puchipuchitos@gmail.com";
 
+
 function AppContent() {
   const [activeView, setActiveView] = useState('main');
   const [showLyrics, setShowLyrics] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
-  const [showSocial, setShowSocial] = useState(false); 
-  
-  const { 
-    user, 
-    isGuest,           
-    enterAsGuest,      
+  const [showSocial, setShowSocial] = useState(false);
+
+  const {
+    user,
+    isGuest,
+    enterAsGuest,
     loginWithGoogle,
-    settings, 
-    isPlaying, 
-    pause, 
-    resume, 
-    nextTrack, 
-    prevTrack 
-  } = usePlayer(); 
+    settings,
+    isPlaying,
+    pause,
+    resume,
+    nextTrack,
+    prevTrack,
+    isLoading
+  } = usePlayer();
 
-  const isAdmin = user?.email === 'puchipuchitos@gmail.com';
-
-  // Sincronización con Electron IPC para atajos de teclado
+  // --- 1. TODOS LOS HOOKS SIEMPRE ARRIBA ---
   useEffect(() => {
     if (window.electron && window.electron.ipcRenderer) {
       const handlePlayerControl = (event, action) => {
+        console.log("Comando Electron recibido:", action);
         switch (action) {
-          case 'togglePause': isPlaying ? pause() : resume(); break;
-          case 'next': nextTrack(); break;
-          case 'prev': prevTrack(); break;
-          default: break;
+          case 'togglePause':
+            // Usamos una referencia lógica simple: si está reproduciendo, pausa; si no, resume.
+            if (isPlaying) {
+              pause();
+            } else {
+              resume();
+            }
+            break;
+          case 'next':
+            nextTrack();
+            break;
+          case 'prev':
+            prevTrack();
+            break;
+          default:
+            break;
         }
       };
-      
+
       window.electron.ipcRenderer.on('player-control', handlePlayerControl);
-      return () => window.electron.ipcRenderer.removeListener('player-control', handlePlayerControl);
+      
+      return () => {
+        window.electron.ipcRenderer.removeListener('player-control', handlePlayerControl);
+      };
     }
+    // Quitamos isPlaying de las dependencias si causa micro-pausas, 
+    // pero lo mantenemos si queremos que el switch tenga el valor real.
   }, [isPlaying, pause, resume, nextTrack, prevTrack]);
 
-  // --- PROTECCIÓN DE RUTA: SI NO HAY USUARIO NI ES INVITADO, MOSTRAR LOGIN ---
+  // --- 2. LÓGICA DE VARIABLES ---
+  const isAdmin = user?.email === 'puchipuchitos@gmail.com';
+
+  // --- 3. RETORNOS CONDICIONALES (SIEMPRE DESPUÉS DE LOS HOOKS) ---
+
+  // Pantalla de carga
+  if (isLoading) {
+    return (
+      <div style={{
+        background: '#09090b',
+        height: '100vh',
+        width: '100vw',
+        display: 'flex',
+        alignItems: 'center',
+        justifyContent: 'center'
+      }}>
+        <div style={{ color: 'white', letterSpacing: '4px', fontWeight: 'bold' }}>CARGANDO KLANG...</div>
+      </div>
+    );
+  }
+
+  // Pantalla de Login / Acceso
   if (!user && !isGuest) {
     return (
-      <div style={{ 
-        height: '100vh', 
-        width: '100vw', 
-        display: 'flex', 
+      <div style={{
+        height: '100vh',
+        width: '100vw',
+        display: 'flex',
         flexDirection: 'column',
-        alignItems: 'center', 
-        justifyContent: 'center', 
-        backgroundColor: '#09090b', 
+        alignItems: 'center',
+        justifyContent: 'center',
+        backgroundColor: '#09090b',
         color: 'white',
-        fontFamily: 'sans-serif'
+        fontFamily: 'Plus Jakarta Sans, sans-serif'
       }}>
-        <div style={{ textAlign: 'center', animation: 'fadeIn 0.5s ease-in' }}>
-          <h1 style={{ letterSpacing: '12px', fontWeight: '900', fontSize: '3rem', margin: '0' }}>KLANG</h1>
+        <div style={{ textAlign: 'center' }}>
+          <h1 style={{ letterSpacing: '12px', fontWeight: '900', fontSize: '3.5rem', margin: '0' }}>KLANG</h1>
           <p style={{ color: '#71717a', marginBottom: '40px', marginTop: '10px' }}>Tu música, sin interrupciones.</p>
-          
+
           <div style={{ display: 'flex', flexDirection: 'column', gap: '12px', alignItems: 'center' }}>
-            <button 
+            <button
               onClick={loginWithGoogle}
               style={{
-                padding: '14px 28px',
-                backgroundColor: 'white',
-                color: 'black',
-                border: 'none',
-                borderRadius: '8px',
-                fontWeight: 'bold',
-                fontSize: '1rem',
-                cursor: 'pointer',
-                transition: 'transform 0.2s',
-                display: 'flex',
-                alignItems: 'center',
-                gap: '10px',
-                width: '280px',
-                justifyContent: 'center'
+                padding: '14px 28px', backgroundColor: 'white', color: 'black',
+                border: 'none', borderRadius: '8px', fontWeight: 'bold', width: '300px', cursor: 'pointer',
+                transition: 'transform 0.2s'
               }}
-              onMouseOver={(e) => e.currentTarget.style.transform = 'scale(1.05)'}
-              onMouseOut={(e) => e.currentTarget.style.transform = 'scale(1)'}
+              onMouseEnter={(e) => e.currentTarget.style.transform = 'scale(1.02)'}
+              onMouseLeave={(e) => e.currentTarget.style.transform = 'scale(1)'}
             >
-              <img src="https://www.gstatic.com/firebasejs/ui/2.0.0/images/auth/google.svg" alt="" width="18" />
               Entrar con Google
             </button>
 
-            <button 
+            <button
               onClick={enterAsGuest}
               style={{
-                padding: '14px 28px',
-                backgroundColor: 'transparent',
-                color: '#a1a1aa',
-                border: '1px solid #27272a',
-                borderRadius: '8px',
-                fontWeight: '600',
-                fontSize: '0.9rem',
-                cursor: 'pointer',
-                transition: 'all 0.2s',
-                width: '280px'
+                padding: '14px 28px', backgroundColor: 'transparent', color: '#a1a1aa',
+                border: '1px solid #27272a', borderRadius: '8px', width: '300px', cursor: 'pointer',
+                transition: 'all 0.2s'
               }}
-              onMouseOver={(e) => {
-                e.currentTarget.style.borderColor = '#52525b';
-                e.currentTarget.style.color = 'white';
-              }}
-              onMouseOut={(e) => {
-                e.currentTarget.style.borderColor = '#27272a';
-                e.currentTarget.style.color = '#a1a1aa';
-              }}
+              onMouseEnter={(e) => e.currentTarget.style.borderColor = '#52525b'}
+              onMouseLeave={(e) => e.currentTarget.style.borderColor = '#27272a'}
             >
               Acceder como Invitado (Local)
             </button>
@@ -128,50 +142,49 @@ function AppContent() {
     );
   }
 
-  // --- INTERFAZ PRINCIPAL (SI HAY USER O ES GUEST) ---
+  // --- 4. INTERFAZ PRINCIPAL ---
   return (
-    <div 
-      data-theme={settings?.theme || 'dark'} 
-      style={{ 
-        display: 'flex', 
-        flexDirection: 'column', 
-        height: '100vh', 
-        width: '100vw', 
-        backgroundColor: 'var(--bg-dark)', 
-        overflow: 'hidden'
+    <div
+      data-theme={settings?.theme || 'dark'}
+      style={{
+        display: 'flex',
+        flexDirection: 'column',
+        height: '100vh',
+        width: '100vw',
+        backgroundColor: '#09090b',
+        overflow: 'hidden',
+        color: 'white'
       }}
     >
-      {/* 1. BARRA DE TÍTULO */}
+      {/* BARRA DE TÍTULO SUPERIOR */}
       <TitleBar onToggleSocial={() => setShowSocial(!showSocial)} isSocialOpen={showSocial} />
 
-      {/* 2. ÁREA DE TRABAJO */}
-      <div style={{ 
-        display: 'flex', 
-        flexDirection: 'row', 
-        flex: 1, 
-        marginTop: '55px', 
-        height: 'calc(100vh - 55px - 90px)', 
+      {/* CUERPO DE LA APP */}
+      <div style={{
+        display: 'flex',
+        flexDirection: 'row',
+        flex: 1,
+        marginTop: '55px', // Altura del TitleBar
+        height: 'calc(100vh - 55px - 90px)', // Restamos TitleBar y PlayerBar
         overflow: 'hidden'
       }}>
-        
-        <Sidebar 
-          activeView={activeView} 
-          setView={setActiveView} 
+        <Sidebar
+          activeView={activeView}
+          setView={setActiveView}
           onOpenSettings={() => setShowSettings(true)}
           isAdmin={isAdmin}
           toggleSocial={() => setShowSocial(!showSocial)}
           isSocialOpen={showSocial}
         />
-        
-        <main style={{ 
-          flex: 1, 
-          display: 'flex', 
-          flexDirection: 'column', 
+
+        <main style={{
+          flex: 1,
+          display: 'flex',
+          flexDirection: 'column',
           overflow: 'hidden',
-          background: 'linear-gradient(to bottom, rgba(255,255,255,0.01), transparent)'
+          position: 'relative'
         }}>
-          <div style={{ flex: 1, overflowY: 'auto', position: 'relative' }}>
-            {/* Aquí implementamos las rutas dentro del main */}
+          <div style={{ flex: 1, overflowY: 'auto', paddingBottom: '20px' }}>
             <Routes>
               <Route path="/" element={
                 activeView === 'admin' && isAdmin ? (
@@ -190,15 +203,16 @@ function AppContent() {
         </main>
       </div>
 
-      {/* 3. PLAYER BAR */}
+      {/* BARRA DE REPRODUCCIÓN INFERIOR */}
       <PlayerBar onOpenLyrics={() => setShowLyrics(!showLyrics)} />
 
-      {/* COMPONENTES FLOTANTES */}
+      {/* COMPONENTES GLOBALES (MODALES/DRAWERS) */}
       <SettingsPanel isOpen={showSettings} onClose={() => setShowSettings(false)} />
       <QueueDrawer />
     </div>
   );
 }
+
 
 export default function App() {
   return (

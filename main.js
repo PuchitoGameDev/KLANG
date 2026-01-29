@@ -29,22 +29,22 @@ function createWindow() {
 
   // --- LÓGICA DE CARGA INTELIGENTE (HÍBRIDA) ---
   if (isDev) {
-    mainWindow.loadURL('http://localhost:5173').catch(() => {
-      console.log("Servidor Vite no detectado. Cargando desde dist/...");
-      mainWindow.loadFile(distPath);
-    });
-    mainWindow.webContents.openDevTools();
+      mainWindow.loadURL('http://localhost:5173').catch(() => {
+          console.warn("Vite no iniciado. Cargando fallback local...");
+          // Usa este método que es más robusto para archivos locales
+          mainWindow.loadURL(`file://${distPath}`); 
+      });
   } else {
-    mainWindow.loadFile(distPath).catch((err) => {
-      console.error("ERROR CRÍTICO AL CARGAR EL ARCHIVO:", distPath);
-      console.error(err);
-    });
+      mainWindow.loadURL(`file://${distPath}`);
   }
 
   // Debug para detectar fallos de rutas
   mainWindow.webContents.on('did-fail-load', (event, errorCode, errorDescription, validatedURL) => {
-    if (!validatedURL.includes('localhost')) {
-      console.log(`Fallo al cargar: ${validatedURL} - ${errorDescription} (${errorCode})`);
+    console.log(`Fallo de red detectado: ${errorDescription} (${errorCode})`);
+    
+    // Si la URL que falló es la del servidor, forzamos carga local
+    if (validatedURL.includes('localhost:5173')) {
+       mainWindow.loadFile(distPath);
     }
   });
 
@@ -65,6 +65,24 @@ function createWindow() {
 // --- GESTIÓN DE LOGS ---
 ipcMain.on('terminal-log', (event, message) => {
   console.log(`[KLANG LOG]: ${message}`);
+});
+
+ipcMain.on('window-minimize', () => {
+  if (mainWindow) mainWindow.minimize();
+});
+
+ipcMain.on('window-maximize', () => {
+  if (mainWindow) {
+    if (mainWindow.isMaximized()) {
+      mainWindow.unmaximize();
+    } else {
+      mainWindow.maximize();
+    }
+  }
+});
+
+ipcMain.on('window-close', () => {
+  if (mainWindow) mainWindow.close();
 });
 
 // --- EVENTOS DE ACTUALIZACIÓN ---

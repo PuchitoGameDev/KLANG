@@ -1,12 +1,13 @@
 {
   "name": "klang-app",
-  "version": "1.0.0",
+  "version": "1.0.2",
   "description": "Klang - Early Access (Local Port Edition)",
+  "author": "PuchitoGameDev",
   "main": "main.js",
   "type": "commonjs",
   "repository": {
     "type": "git",
-    "url": "https://github.com/TU_USUARIO_DE_GITHUB/NOMBRE_DE_TU_REPOSITORIO.git"
+    "url": "https://github.com/PuchitoGameDev/KLANG"
   },
   "scripts": {
     "dev": "vite",

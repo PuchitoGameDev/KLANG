@@ -57,6 +57,7 @@ export function PlayerProvider({ children }) {
   const [boost, setBoost] = useState(1.0);
   const [searchQuery, setSearchQuery] = useState("");
   const [isQueueOpen, setIsQueueOpen] = useState(false);
+  const [isLoading, setIsLoading] = useState(true);
 
   const [currentBandeTracks, setCurrentBandeTracks] = useState([]);
 
@@ -293,32 +294,53 @@ export function PlayerProvider({ children }) {
 
   // --- 11. PLAYLISTS Y FAVORITOS ---
   const loadUserData = useCallback(async (forcedUserId = null) => {
+    // 1. Identificar al usuario
     const userId = forcedUserId || user?.id;
-    if (!userId) return;
+    
+    // 2. RECUPERACIÓN INMEDIATA (Sincrona)
+    // Leemos del disco antes de cualquier IF para tener datos listos ya mismo
+    const savedLocalPlaylists = JSON.parse(localStorage.getItem('klang_local_playlists') || '[]');
+    const savedLocalFavs = JSON.parse(localStorage.getItem('klang_local_favorites') || '[]');
 
+    // 3. ESTADO INICIAL (Reactivo)
+    // Llenamos el estado con lo local inmediatamente. Si el usuario es invitado, 
+    // esto es lo que verá. Si tiene cuenta, esto es lo que verá mientras carga la nube.
+    setMyPlaylists(savedLocalPlaylists);
+    setPlaylists(savedLocalPlaylists);
+    setFavoriteTracks(savedLocalFavs);
+    setFavorites(savedLocalFavs.map(f => f.song_id || f.id));
+
+    // 4. SI NO HAY USUARIO, PARAMOS AQUÍ (Ya hemos cargado lo local)
+    if (!userId) {
+      if (window.electron) window.electron.ipcRenderer.send('terminal-log', "📂 Playlists locales cargadas (Modo Invitado)");
+      return;
+    }
+
+    // 5. INTENTO DE SINCRONIZACIÓN CON LA NUBE (Supabase)
     try {
-      const [favsRes, playlistsRes] = await Promise.all([
-        supabase.from('favorites').select('*').eq('user_id', userId).order('created_at', { ascending: false }),
-        supabase.from('playlists').select(`*, playlist_items (*)`).eq('user_id', userId).order('created_at', { ascending: false })
+      if (window.electron) window.electron.ipcRenderer.send('terminal-log', "☁️ Sincronizando con Supabase...");
+      
+      const [favsRes, plsRes] = await Promise.all([
+        supabase.from('favorites').select('*').eq('user_id', userId),
+        supabase.from('playlists').select(`*, playlist_items (*)`).eq('user_id', userId)
       ]);
 
+      if (favsRes.error || plsRes.error) throw new Error("Error en respuesta de servidor");
+
+      // Si hay datos en la nube, sobreescribimos el estado local con el de la nube
       if (favsRes.data) {
         setFavorites(favsRes.data.map(f => f.song_id));
         setFavoriteTracks(favsRes.data);
       }
-
-      if (playlistsRes.data) {
-        const ordered = playlistsRes.data.map(pl => ({
-          ...pl,
-          playlist_items: (pl.playlist_items || []).sort((a, b) => 
-            new Date(a.created_at) - new Date(b.created_at)
-          )
-        }));
-        setMyPlaylists(ordered);
-        setPlaylists(ordered);
+      if (plsRes.data) {
+        setMyPlaylists(plsRes.data);
+        setPlaylists(plsRes.data);
       }
+      
+      if (window.electron) window.electron.ipcRenderer.send('terminal-log', "✅ Datos de usuario sincronizados");
     } catch (e) {
-      console.error("❌ Error en loadUserData:", e);
+      console.warn("⚠️ Modo Offline: Manteniendo datos locales.", e.message);
+      // No hace falta hacer nada en el catch porque ya cargamos lo local en el paso 3
     }
   }, [user?.id]);
 
@@ -330,6 +352,7 @@ export function PlayerProvider({ children }) {
       setFavorites([]);
       setFavoriteTracks([]);
       setMyPlaylists([]);
+      setIsBanned(false); // Resetear estado de baneo al cerrar sesión
       return; 
     }
     
@@ -337,41 +360,72 @@ export function PlayerProvider({ children }) {
     localStorage.setItem('klang_user_cache', JSON.stringify(session.user));
     loadUserData(session.user.id);
 
+    // --- NUEVA LÓGICA DE SEGURIDAD RESILIENTE ---
     try {
-      const { data: banned } = await supabase.from('banned_users').select('*').eq('user_id', session.user.id).maybeSingle();
-      if (banned) {
+      // Intentamos verificar el baneo con un tiempo límite de 3 segundos
+      const { data: banned, error } = await Promise.race([
+        supabase.from('banned_users').select('*').eq('user_id', session.user.id).maybeSingle(),
+        new Promise((_, reject) => setTimeout(() => reject(new Error("Timeout")), 3000))
+      ]);
+
+      // Solo bloqueamos si Supabase responde afirmativamente que el usuario está en la tabla
+      if (!error && banned) {
         setIsBanned(true);
         await supabase.auth.signOut();
+      } else {
+        // Si no hay baneo o hay un error de red/timeout, permitimos el acceso
+        setIsBanned(false);
       }
-    } catch (e) { console.error("Error seguridad:", e); }
+    } catch (e) { 
+      // En caso de error (sin internet, base de datos caída), el baneo NO bloquea la app
+      console.warn("⚠️ Verificación de seguridad omitida (Modo Offline/Error):", e.message);
+      setIsBanned(false); 
+    }
   }, [loadUserData]);
 
   // --- 9. EFECTOS DE SINCRONIZACIÓN Y PERSISTENCIA ---
   useEffect(() => {
-    const cached = localStorage.getItem('klang_user_cache');
-    if (cached) {
-      try {
-        const parsed = JSON.parse(cached);
-        setUser(parsed);
-        loadUserData(parsed.id);
-      } catch (e) { console.error(e); }
-    }
+    const initAuth = async () => {
+      // A. CARGA AGRESIVA: Antes de mirar internet, cargamos lo que hay en el disco
+      // Esto hace que las playlists aparezcan en menos de 100ms
+      await loadUserData(); 
 
-    const { data: { subscription } } = supabase.auth.onAuthStateChange((event, session) => {
-      if (session?.user) {
-        setUser(session.user);
-        localStorage.setItem('klang_user_cache', JSON.stringify(session.user));
-        loadUserData(session.user.id);
-      } else if (event === 'SIGNED_OUT') {
-        setUser(null);
-        localStorage.removeItem('klang_user_cache');
-        setMyPlaylists([]);
-        setFavoriteTracks([]);
+      const cached = localStorage.getItem('klang_user_cache');
+      if (cached) {
+        try {
+          const parsed = JSON.parse(cached);
+          setUser(parsed);
+          // Recargamos específicamente para este usuario
+          await loadUserData(parsed.id); 
+        } catch (e) { console.error("Error caché:", e); }
       }
+
+      try {
+        const { data: { session } } = await supabase.auth.getSession();
+        if (session) {
+          await handleUser(session);
+        }
+      } catch (e) {
+        console.warn("Supabase offline - Usando modo local");
+      } finally {
+        // Marcamos como cargado solo después de intentar la sesión
+        setIsLoading(false);
+      }
+    };
+
+    initAuth();
+
+    const { data: { subscription } } = supabase.auth.onAuthStateChange(async (event, session) => {
+      if (session) {
+        await handleUser(session);
+      }
+      setIsLoading(false);
     });
 
-    return () => subscription.unsubscribe();
-  }, [loadUserData]);
+    return () => {
+      if (subscription) subscription.unsubscribe();
+    };
+  }, [loadUserData, handleUser]);
 
   useEffect(() => { queueRef.current = queue; }, [queue]);
   useEffect(() => { currentIndexRef.current = currentIndex; }, [currentIndex]);
@@ -385,7 +439,7 @@ export function PlayerProvider({ children }) {
     }, 2000); 
 
     return () => clearTimeout(timer);
-  }, [queue.length, currentIndex, preLinkNextTracks]);
+  }, [queue.length, currentIndex]);
 
   useEffect(() => {
     localStorage.setItem('klang_settings', JSON.stringify(settings));
@@ -563,6 +617,7 @@ export function PlayerProvider({ children }) {
       setLocalPlaylists(updated);
       localStorage.setItem('klang_local_playlists', JSON.stringify(updated));
       setIsGuest(true);
+      await loadUserData();
       return newPlaylist;
     } else {
       // MODO SUPABASE (Tu código original)
@@ -652,23 +707,46 @@ export function PlayerProvider({ children }) {
   const enterAsGuest = useCallback(() => {
     setIsGuest(true);
     setUser(null);
-    // Limpiamos el caché de usuario para evitar conflictos
     localStorage.removeItem('klang_user_cache');
     
+    // Forzamos la carga de playlists locales e indicamos que ya no carga
+    loadUserData();
+    setIsLoading(false); 
+    
     if (window.electron) {
-      window.electron.ipcRenderer.send('terminal-log', "👤 Acceso como invitado activado");
+      window.electron.ipcRenderer.send('terminal-log', "👤 Acceso como invitado: Playlists locales activas");
     }
-  }, []);
+  }, [loadUserData]);
 
-  if (isBanned) return (
-    <div style={{ height: '100vh', display: 'flex', alignItems: 'center', justifyContent: 'center', background: '#000', color: '#ff4444' }}>
-      <h1>ACCESO RESTRINGIDO</h1>
-    </div>
-  );
+  useEffect(() => {
+    if (!user || isGuest) {
+      setMyPlaylists(localPlaylists);
+      setPlaylists(localPlaylists);
+    }
+  }, [localPlaylists, user, isGuest]);
+
+  if (isBanned === true) {
+    return (
+      <div style={{ 
+        height: '100vh', 
+        display: 'flex', 
+        flexDirection: 'column',
+        alignItems: 'center', 
+        justifyContent: 'center', 
+        background: '#09090b', 
+        color: '#ff4444',
+        fontFamily: 'Plus Jakarta Sans'
+      }}>
+        <h1 style={{ fontSize: '3rem', fontWeight: '800' }}>ACCESO RESTRINGIDO</h1>
+        <p style={{ color: '#a1a1aa' }}>Esta cuenta ha sido suspendida de la red KLANG.</p>
+      </div>
+    );
+  }
 
   return (
     <PlayerContext.Provider value={{
-      user, loginWithGoogle,
+      user, isLoading,
+      loginWithGoogle,
       logout: async () => { 
         if (user) await supabase.from('profiles').update({ is_online: false }).eq('id', user.id);
         await supabase.auth.signOut(); 

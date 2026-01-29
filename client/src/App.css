@@ -1,0 +1,126 @@
+/* --- CONFIGURACIÓN ESTRUCTURAL (LAYOUT) --- */
+html, body, #root {
+  margin: 0 !important;
+  padding: 0 !important;
+  width: 100vw !important;
+  height: 100vh !important;
+  max-width: 100vw !important;
+  overflow: hidden; /* Evita scrolls fantasma */
+  background-color: #000;
+  color: #fff;
+}
+
+#root {
+  display: flex;
+  flex-direction: column;
+  overflow: visible !important;
+}
+
+/* CONTENEDOR PRINCIPAL: Deja espacio para la TitleBar fija */
+main, .main-content {
+  flex: 1;
+  margin-top: 40px; /* Altura de la TitleBar */
+  height: calc(100vh - 40px);
+  overflow-y: auto;
+  position: relative;
+}
+
+/* --- ESTILOS ESPECÍFICOS PARA LA TITLEBAR --- */
+
+/* Reset de botones: Elimina cuadros blancos y estilos de sistema */
+.titlebar-button {
+  appearance: none !important;
+  background: transparent !important;
+  border: none !important;
+  box-shadow: none !important;
+  outline: none !important;
+  padding: 0 !important;
+  margin: 0 !important;
+  display: flex !important;
+  align-items: center !important;
+  justify-content: center !important;
+  cursor: pointer !important;
+  color: #71717a; /* zinc-400 */
+  transition: all 0.2s ease;
+  -webkit-app-region: no-drag; /* CRÍTICO: Permite clics en área de arrastre */
+}
+
+.titlebar-button:hover {
+  background-color: rgba(255, 255, 255, 0.05) !important;
+  color: #ffffff !important;
+}
+
+/* Estilo especial para el botón de cerrar */
+.btn-close:hover {
+  background-color: #e81123 !important; /* Rojo estándar de Windows */
+  color: white !important;
+}
+
+/* --- ESTILOS ORIGINALES DEL USUARIO (PRESERVADOS) --- */
+.logo {
+  height: 6em;
+  padding: 1.5em;
+  will-change: filter;
+  transition: filter 300ms;
+}
+
+.logo:hover {
+  filter: drop-shadow(0 0 2em #646cffaa);
+}
+
+.logo.react:hover {
+  filter: drop-shadow(0 0 2em #61dafbaa);
+}
+
+@keyframes logo-spin {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  a:nth-of-type(2) .logo {
+    animation: logo-spin infinite 20s linear;
+  }
+}
+
+.card {
+  padding: 2em;
+}
+
+.read-the-docs {
+  color: #888;
+}
+
+/* --- UTILIDADES EXTRAS PARA KLANG --- */
+.font-mono-tech {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+}
+
+.glass-effect {
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  background: rgba(255, 255, 255, 0.03);
+  border: 1px solid rgba(255, 255, 255, 0.05);
+}
+
+/* --- ANIMACIÓN FRESNEL (BRILLO) --- */
+@keyframes shine {
+  0% { transform: translateX(-100%) skewX(-15deg); }
+  50%, 100% { transform: translateX(200%) skewX(-15deg); }
+}
+
+.animate-shine {
+  animation: shine 1.5s cubic-bezier(0.4, 0, 0.2, 1) infinite;
+  /* El brillo es blanco con opacidad muy baja */
+  background: linear-gradient(
+    90deg, 
+    transparent, 
+    rgba(255, 255, 255, 0.08), 
+    transparent
+  );
+  width: 50%; /* Ancho del rayo de luz */
+}
+
+.cet-title {
+  display: none !important;
+}

@@ -1,13 +1,49 @@
 const { app, BrowserWindow, ipcMain, globalShortcut, dialog } = require('electron');
 const path = require('path');
 const isDev = require('electron-is-dev');
+const { fork } = require('child_process');
 const { autoUpdater } = require('electron-updater');
 
 let mainWindow;
+let serverProcess; // Variable para controlar el proceso del servidor
 
 // --- CONFIGURACIÓN DE AUTO-UPDATES ---
 autoUpdater.autoDownload = true;
 autoUpdater.autoInstallOnAppQuit = true;
+
+function startServer() {
+  // Intentamos buscar el servidor en las dos ubicaciones posibles de Electron
+  const pathsToTry = [
+    path.join(__dirname, 'server', 'index.js'), // Modo Desarrollo o empaquetado ASAR
+    path.join(process.resourcesPath, 'app', 'server', 'index.js'), // Alternativa de empaquetado
+    path.join(process.resourcesPath, 'server', 'index.js') // Modo extraResources
+  ];
+
+  let serverPath = null;
+  const fs = require('fs');
+
+  for (const p of pathsToTry) {
+    if (fs.existsSync(p)) {
+      serverPath = p;
+      break;
+    }
+  }
+
+  if (!serverPath) {
+    console.error('CRÍTICO: No se encontró el archivo del servidor en ninguna ruta.');
+    return;
+  }
+
+  serverProcess = fork(serverPath, [], {
+    env: { 
+      NODE_ENV: 'production',
+      PORT: 5002
+    },
+    stdio: 'inherit' // Esto hará que los errores del servidor salgan en tu consola
+  });
+
+  serverProcess.on('error', (err) => console.error('Error en proceso servidor:', err));
+}
 
 function createWindow() {
   mainWindow = new BrowserWindow({
@@ -24,25 +60,23 @@ function createWindow() {
     },
   });
 
-  // Definimos la ruta al archivo index.html de producción
+  // Ruta al archivo index.html de producción
   const distPath = path.join(__dirname, 'dist', 'index.html');
 
-  // --- LÓGICA DE CARGA INTELIGENTE (HÍBRIDA) ---
+  // --- LÓGICA DE CARGA INTELIGENTE ---
   if (isDev) {
       mainWindow.loadURL('http://localhost:5173').catch(() => {
           console.warn("Vite no iniciado. Cargando fallback local...");
-          // Usa este método que es más robusto para archivos locales
-          mainWindow.loadURL(`file://${distPath}`); 
+          mainWindow.loadFile(distPath); 
       });
   } else {
-      mainWindow.loadURL(`file://${distPath}`);
+      mainWindow.loadFile(distPath);
   }
 
   // Debug para detectar fallos de rutas
   mainWindow.webContents.on('did-fail-load', (event, errorCode, errorDescription, validatedURL) => {
     console.log(`Fallo de red detectado: ${errorDescription} (${errorCode})`);
     
-    // Si la URL que falló es la del servidor, forzamos carga local
     if (validatedURL.includes('localhost:5173')) {
        mainWindow.loadFile(distPath);
     }
@@ -67,6 +101,7 @@ ipcMain.on('terminal-log', (event, message) => {
   console.log(`[KLANG LOG]: ${message}`);
 });
 
+// --- CONTROLES DE VENTANA ---
 ipcMain.on('window-minimize', () => {
   if (mainWindow) mainWindow.minimize();
 });
@@ -102,9 +137,9 @@ autoUpdater.on('update-downloaded', (info) => {
 });
 
 app.whenReady().then(() => {
-  createWindow();
+  startServer(); // Primero el servidor
+  createWindow(); // Luego la interfaz
 
-  // Buscar actualizaciones solo si no estamos en modo desarrollo
   if (!isDev) {
     autoUpdater.checkForUpdatesAndNotify();
   }
@@ -119,5 +154,7 @@ app.on('will-quit', () => {
 });
 
 app.on('window-all-closed', () => {
+  // Matamos el proceso del servidor al cerrar la app
+  if (serverProcess) serverProcess.kill();
   if (process.platform !== 'darwin') app.quit();
 });

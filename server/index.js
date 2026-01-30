@@ -8,6 +8,7 @@ const { spawn } = require('child_process');
 const path = require('path');
 const https = require('https');
 const axios = require('axios');
+const fs = require('fs');
 
 // --- NUEVO MOTOR YOUTUBE MUSIC ---
 const YTMusicClass = require('ytmusic-api');
@@ -36,20 +37,31 @@ client.login(process.env.DISCORD_TOKEN).catch(err => {
     console.error("❌ Error de Login Discord:", err.message);
 });
 
-// --- 3. MOTOR DE STREAMING (ULTRA-OPTIMIZADO) ---
+// --- 3. MOTOR DE STREAMING (ULTRA-OPTIMIZADO CON RUTAS DINÁMICAS) ---
 
 app.get('/api/stream', (req, res) => {
     const { id } = req.query;
     if (!id) return res.status(400).send("Falta el ID del video");
 
-    const ytDlpPath = path.join(__dirname, 'yt-dlp.exe');
-    const denoPath = path.join(__dirname, 'deno.exe');
-    const cookiesPath = path.join(__dirname, 'cookies.txt');
+    // DETECCIÓN DINÁMICA DE RUTAS PARA PRODUCCIÓN (.EXE)
+    // En el .exe instalado, los archivos están en 'resources/server'
+    const isProd = process.env.NODE_ENV === 'production';
+    const basePath = isProd 
+        ? path.join(process.resourcesPath, 'server') 
+        : __dirname;
+
+    const ytDlpPath = path.join(basePath, 'yt-dlp.exe');
+    const denoPath = path.join(basePath, 'deno.exe');
+    const cookiesPath = path.join(basePath, 'cookies.txt');
     
+    // Verificación de seguridad (opcional para debug)
+    if (!fs.existsSync(ytDlpPath)) {
+        console.error(`❌ No se encontró yt-dlp en: ${ytDlpPath}`);
+    }
+
     if (urlCache.has(id)) {
         const cached = urlCache.get(id);
         if (Date.now() < cached.expires) {
-            // Se añadió req aquí
             return streamFromGoogle(cached.url, res, req);
         }
     }
@@ -57,6 +69,7 @@ app.get('/api/stream', (req, res) => {
     const ytDlp = spawn(ytDlpPath, [
         '-g', `https://www.youtube.com/watch?v=${id}`,
         '-f', '251',
+        '-f', 'bestaudio', // Fallback si 251 no existe
         '--cookies', cookiesPath,
         '--js-runtimes', `deno:${denoPath}`,
         '--no-check-formats', '--no-warning', '--no-check-certificate'
@@ -64,14 +77,19 @@ app.get('/api/stream', (req, res) => {
 
     let urlData = '';
     ytDlp.stdout.on('data', (data) => { urlData += data.toString(); });
+    
+    ytDlp.on('error', (err) => {
+        console.error("❌ Error al ejecutar yt-dlp:", err);
+        if (!res.headersSent) res.status(500).send("Error interno del motor de streaming");
+    });
+
     ytDlp.on('close', (code) => {
         if (code === 0 && urlData.trim()) {
             const finalUrl = urlData.trim();
             urlCache.set(id, { url: finalUrl, expires: Date.now() + (5 * 60 * 60 * 1000) });
-            // Se añadió req aquí
             streamFromGoogle(finalUrl, res, req);
         } else {
-            res.status(500).send("Error en la extracción del audio");
+            if (!res.headersSent) res.status(500).send("Error en la extracción del audio");
         }
     });
 });
@@ -81,13 +99,11 @@ function streamFromGoogle(url, res, req) {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36'
     };
 
-    // Si el usuario pide un rango (seek), se lo solicitamos a Google
     if (req.headers.range) {
         headers['Range'] = req.headers.range;
     }
 
     https.get(url, { headers }, (proxyRes) => {
-        // Establecemos el estado (200 OK o 206 Partial Content)
         res.status(proxyRes.statusCode);
 
         const responseHeaders = {
@@ -96,7 +112,6 @@ function streamFromGoogle(url, res, req) {
             'Access-Control-Allow-Origin': '*',
         };
 
-        // Reenviamos cabeceras de rango si Google las proporciona
         if (proxyRes.headers['content-range']) {
             responseHeaders['Content-Range'] = proxyRes.headers['content-range'];
         }
@@ -112,38 +127,28 @@ function streamFromGoogle(url, res, req) {
     });
 }
 
-// --- 4. NUEVO: MOTOR DE LETRAS AUTOMÁTICAS ---
-/**
- * Busca letras sincronizadas (LRC) usando el ID de YouTube.
- * Utiliza el servicio gratuito LRCLIB.
- */
+// --- 4. MOTOR DE LETRAS AUTOMÁTICAS ---
 app.get('/api/lyrics', async (req, res) => {
     let { id, q } = req.query;
 
     try {
-        // 1. Intentar por ID directo
         let response = await axios.get(`https://lrclib.net/api/get?youtube_id=${id}`, {
             headers: { 'User-Agent': 'KlangMusic/1.0' },
             timeout: 3000
         }).catch(() => null);
 
-        // 2. Si no hay ID y no hay Q, intentamos obtener el título usando tu motor ytmusic
         if (!response?.data && (!q || q.trim() === "")) {
-            console.log("🛠 Obteniendo metadatos de YT para búsqueda...");
             const trackInfo = await ytmusic.getSong(id).catch(() => null);
             if (trackInfo) {
                 q = `${trackInfo.name} ${trackInfo.artist?.name || ''}`;
             }
         }
 
-        // 3. Buscar por texto (Q)
         if (!response?.data && q) {
-            console.log(`🔎 Buscando por texto: ${q}`);
             const searchRes = await axios.get(`https://lrclib.net/api/search?q=${encodeURIComponent(q)}`, {
                 headers: { 'User-Agent': 'KlangMusic/1.0' }
             });
             if (searchRes.data?.length > 0) {
-                // Priorizar el que tenga letras sincronizadas
                 response = { data: searchRes.data.find(s => s.syncedLyrics) || searchRes.data[0] };
             }
         }
@@ -174,26 +179,18 @@ app.get('/api/search', async (req, res) => {
 
         const cleanResults = results.map(item => {
             const getBestArtistName = (s) => {
-                // 1. Si es búsqueda de artista, el nombre está en 'name'
                 if (type === 'artists') return s.name || "Artista desconocido";
-
-                // 2. Nueva estructura de ytmusicapi: item.artists es un array de objetos
                 if (Array.isArray(s.artists) && s.artists.length > 0) {
                     return s.artists[0].name || s.artists[0].author || "Artista desconocido";
                 }
-
-                // 3. Algunas versiones devuelven 'artist' (en singular) como array o string
                 if (s.artist) {
                     if (Array.isArray(s.artist) && s.artist.length > 0) return s.artist[0].name;
                     if (typeof s.artist === 'string') return s.artist;
                     if (typeof s.artist === 'object') return s.artist.name;
                 }
-
-                // 4. Fallback a author (videos normales de YouTube)
                 if (s.author) {
                     return typeof s.author === 'string' ? s.author : (s.author.name || "Artista desconocido");
                 }
-
                 return "Artista desconocido";
             };
 
@@ -287,7 +284,6 @@ app.get('/api/sync/load/:userId', async (req, res) => {
 const start = async () => {
     try {
         console.log("⏳ Inicializando YouTube Music...");
-        // Le damos un tiempo límite a la inicialización
         await Promise.race([
             ytmusic.initialize(),
             new Promise((_, reject) => setTimeout(() => reject(new Error("Timeout YT")), 5000))
@@ -297,7 +293,6 @@ const start = async () => {
             console.log(`🚀 Servidor Klang activo en http://localhost:${PORT}`);
         });
     } catch (err) {
-        // Obligamos al servidor a arrancar aunque haya errores críticos
         console.error("❌ Error durante el inicio, forzando arranque local:", err);
         app.listen(PORT, () => {
             console.log(`🚀 Servidor Klang arrancado en MODO EMERGENCIA (Puerto ${PORT})`);

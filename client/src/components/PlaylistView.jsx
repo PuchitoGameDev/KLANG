@@ -17,6 +17,7 @@ export default function PlaylistView({ playlist: initialPlaylist, onBack }) {
     const [currentPlaylist, setCurrentPlaylist] = useState(initialPlaylist);
     
     // Estados de UI
+    const [isLinking, setIsLinking] = useState(false);
     const [menuConfig, setMenuConfig] = useState(null);
     const [showRenameModal, setShowRenameModal] = useState(false);
     const [showDeleteModal, setShowDeleteModal] = useState(false);
@@ -33,13 +34,29 @@ export default function PlaylistView({ playlist: initialPlaylist, onBack }) {
 
     const tracks = currentPlaylist.playlist_items || [];
 
-    const getNormalizedTracks = () => tracks.map(t => ({
-        ...t,
-        artist: t.artist || t.author || "Artista desconocido",
-        id: t.song_id || t.id 
-    }));
+    const getNormalizedTracks = () => tracks.map(t => {
+        const finalId = t.song_id || t.id;
+        return {
+            ...t,
+            artist: t.artist || t.author || "Artista desconocido",
+            id: finalId,
+            // Aseguramos que el reproductor reconozca el ID de YouTube
+            youtubeId: String(finalId).startsWith('pending-') ? null : finalId
+        };
+    });
 
-    const handlePlayAll = () => tracks.length > 0 && setQueueAndPlay(getNormalizedTracks(), 0);
+    const handlePlayAll = () => {
+        if (tracks.length === 0) return;
+
+        // Normalizamos y filtramos tracks que no tengan ID válido si es necesario,
+        // aunque lo ideal es pasarle todo y que el reproductor gestione el "pending"
+        const tracksToPlay = getNormalizedTracks();
+        
+        console.log("Reproduciendo lista completa:", tracksToPlay);
+        
+        // Forzamos el inicio desde la primera canción (índice 0)
+        setQueueAndPlay(tracksToPlay, 0);
+    };
 
     // --- ACCIONES NATIVAS ---
     const confirmRename = async () => {
@@ -53,6 +70,18 @@ export default function PlaylistView({ playlist: initialPlaylist, onBack }) {
         setShowDeleteModal(false);
         onBack(); 
         await deletePlaylist(currentPlaylist.id);
+    };
+
+    const handleLinkAll = async () => {
+        if (isLinking) return;
+        setIsLinking(true);
+        try {
+            await startAutoLinking(currentPlaylist.id);
+        } catch (error) {
+            console.error("Error vinculando:", error);
+        } finally {
+            setIsLinking(false);
+        }
     };
 
     const openPlaylistMenu = (e) => {
@@ -148,12 +177,29 @@ export default function PlaylistView({ playlist: initialPlaylist, onBack }) {
                 {tracks.some(t => String(t.song_id || t.id).startsWith('pending-')) && (
                     <button 
                         className="action-icon-btn linker-btn" 
-                        onClick={() => startAutoLinking(currentPlaylist.id)}
+                        onClick={handleLinkAll}
+                        disabled={isLinking}
                         title="Vincular canciones automáticamente"
-                        style={{ color: '#3b82f6', display: 'flex', alignItems: 'center', gap: '8px', fontSize: '0.9rem', fontWeight: 'bold', background: 'rgba(59, 130, 246, 0.1)', padding: '10px 20px', borderRadius: '20px' }}
+                        style={{ 
+                            color: '#3b82f6', 
+                            display: 'flex', 
+                            alignItems: 'center', 
+                            gap: '8px', 
+                            fontSize: '0.9rem', 
+                            fontWeight: 'bold', 
+                            background: 'rgba(59, 130, 246, 0.1)', 
+                            padding: '10px 20px', 
+                            borderRadius: '20px',
+                            opacity: isLinking ? 0.6 : 1,
+                            cursor: isLinking ? 'not-allowed' : 'pointer'
+                        }}
                     >
-                        <Zap size={20} fill="#3b82f6" />
-                        <span>Vincular todo</span>
+                        {isLinking ? (
+                            <span className="syncing-icon">⏳</span>
+                        ) : (
+                            <Zap size={20} fill="#3b82f6" />
+                        )}
+                        <span>{isLinking ? 'Vinculando...' : 'Vincular todo'}</span>
                     </button>
                 )}
 

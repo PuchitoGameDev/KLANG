@@ -56,8 +56,10 @@ export function PlayerProvider({ children }) {
   const [volume, setVolume] = useState(1);
   const [boost, setBoost] = useState(1.0);
   const [searchQuery, setSearchQuery] = useState("");
+  const [searchResults, setSearchResults] = useState([]);
   const [isQueueOpen, setIsQueueOpen] = useState(false);
   const [isLoading, setIsLoading] = useState(true);
+  
 
   const [currentBandeTracks, setCurrentBandeTracks] = useState([]);
 
@@ -102,16 +104,17 @@ export function PlayerProvider({ children }) {
   }, []);
 
   const syncTrackIdToSupabase = async (pendingId, realId) => {
+    if (String(pendingId).startsWith('item-')) return; // No existe en Supabase
+
     try {
       const { error } = await supabase
         .from('playlist_items')
         .update({ song_id: realId })
-        .eq('song_id', pendingId);
+        .eq('song_id', pendingId); // Solo funcionará si pendingId es el que se guardó en la nube
 
       if (error) throw error;
-      if (window.electron) window.electron.ipcRenderer.send('terminal-log', `💾 ID Persistido en DB: ${realId}`);
     } catch (e) {
-      console.error("Error persistencia Supabase:", e);
+      console.warn("Persistencia omitida: Item local o error de red.");
     }
   };
 
@@ -199,8 +202,7 @@ export function PlayerProvider({ children }) {
     let trackId = track.youtubeId || track.song_id || track.id;
     const audio = audioRef.current;
     
-    // Limpieza previa para evitar solapamientos visuales/sonoros
-    setIsPlaying(false);
+    // Detenemos cualquier carga previa inmediatamente
     audio.pause();
 
     if (String(trackId).startsWith('pending-')) {
@@ -224,24 +226,40 @@ export function PlayerProvider({ children }) {
     try {
       await ensureAudioGraph();
       const qualityParam = settings.quality === 'low' ? '&quality=low' : settings.quality === 'medium' ? '&quality=medium' : '';
-      
-      audio.src = `http://localhost:5002/api/stream?id=${trackId}${qualityParam}`;
-      audio.preload = "auto";
+      const newSrc = `http://localhost:5002/api/stream?id=${trackId}${qualityParam}`;
+
+      // SOLO cargamos si la fuente es distinta para evitar interrupciones innecesarias
+      if (audio.src !== newSrc) {
+        audio.src = newSrc;
+        audio.load(); // Forzamos carga limpia
+      }
+
       audio.playbackRate = settings.playbackSpeed;
 
-      await audio.play();
-      
-      setIsPlaying(true);
-      setCurrentIndex(index);
-      currentIndexRef.current = index;
-      updateSocialStatus(track); 
+      // MANEJO DE PROMESA SEGURO
+      const playPromise = audio.play();
+      if (playPromise !== undefined) {
+        playPromise
+          .then(() => {
+            setIsPlaying(true);
+            setCurrentIndex(index);
+            currentIndexRef.current = index;
+            updateSocialStatus(track);
+          })
+          .catch(err => {
+            if (err.name === 'AbortError') {
+              console.log("Klang: Carga interrumpida por nueva petición.");
+            } else {
+              console.error("Error real de audio:", err);
+            }
+          });
+      }
 
       if (settings.showNotifications && "Notification" in window && Notification.permission === "granted") {
         new Notification("Klang", { body: `${track.title} - ${track.artist}`, icon: track.thumbnail, silent: true });
       }
     } catch (err) { 
-      console.error("Error en playIndex:", err);
-      if (index + 1 < tracks.length) playIndex(index + 1);
+      console.error("Error en flujo playIndex:", err);
     }
   }, [settings.quality, settings.playbackSpeed, settings.showNotifications, normalizeTrackData, searchYouTubeId, updateSocialStatus]);
 
@@ -500,70 +518,209 @@ export function PlayerProvider({ children }) {
     const clean = normalizeTrackData(track);
     const trackId = clean.youtubeId || clean.song_id || clean.id;
 
-    if (!user) {
-      // LÓGICA LOCAL
-      let updated;
-      if (favorites.includes(trackId)) {
-        updated = localFavorites.filter(f => (f.youtubeId || f.song_id || f.id) !== trackId);
-      } else {
-        updated = [clean, ...localFavorites];
+    // --- 1. INTENTO CON LA NUBE (Si hay usuario) ---
+    if (user) {
+      try {
+        if (favorites.includes(trackId)) {
+          // Intentar borrar de la nube
+          const { error } = await supabase.from('favorites')
+            .delete()
+            .eq('user_id', user.id)
+            .eq('song_id', trackId);
+          
+          if (error) throw error;
+          setFavorites(prev => prev.filter(id => id !== trackId));
+          setFavoriteTracks(prev => prev.filter(f => (f.song_id || f.id) !== trackId));
+        } else {
+          // Intentar insertar en la nube
+          const { error } = await supabase.from('favorites').insert({ 
+            user_id: user.id, 
+            song_id: trackId, 
+            title: clean.title, 
+            artist: clean.artist, 
+            thumbnail: clean.thumbnail 
+          });
+
+          if (error) throw error;
+          setFavorites(prev => [trackId, ...prev]);
+          setFavoriteTracks(prev => [clean, ...prev]);
+        }
+        
+        if (window.electron) window.electron.ipcRenderer.send('terminal-log', "☁️ Favorito sincronizado en la nube");
+        return; // Éxito en la nube, salimos de la función
+
+      } catch (e) {
+        console.warn("⚠️ Fallo en la nube, usando almacenamiento local de respaldo:", e.message);
+        // Si llegamos aquí, es que Supabase falló (Error 400, sin internet, etc.)
+        // No salimos con 'return', dejamos que el código siga hacia la lógica local
       }
-      setLocalFavorites(updated);
-      localStorage.setItem('klang_local_favorites', JSON.stringify(updated));
-      return;
     }
 
-    // LÓGICA SUPABASE (Tu código original)
+    // --- 2. FALLBACK: LÓGICA LOCAL (Si no hay usuario o falló la nube) ---
+    let updatedLocal;
     if (favorites.includes(trackId)) {
-      await supabase.from('favorites').delete().eq('user_id', user.id).eq('song_id', trackId);
-      setFavorites(prev => prev.filter(id => id !== trackId));
+      // Quitar de local
+      updatedLocal = localFavorites.filter(f => (f.youtubeId || f.song_id || f.id) !== trackId);
     } else {
-      await supabase.from('favorites').insert({ 
-        user_id: user.id, song_id: trackId, title: clean.title, 
-        artist: clean.artist, thumbnail: clean.thumbnail 
-      });
-      setFavorites(prev => [trackId, ...prev]);
+      // Añadir a local
+      updatedLocal = [clean, ...localFavorites];
+    }
+
+    // Actualizar estados y persistencia en disco
+    setLocalFavorites(updatedLocal);
+    setFavoriteTracks(updatedLocal);
+    setFavorites(updatedLocal.map(f => f.youtubeId || f.song_id || f.id));
+    localStorage.setItem('klang_local_favorites', JSON.stringify(updatedLocal));
+
+    if (window.electron) {
+      window.electron.ipcRenderer.send('terminal-log', `💾 Favorito guardado localmente (Backup)`);
     }
   };
 
   const addTrackToPlaylist = async (playlistId, track) => {
     const clean = normalizeTrackData(track);
     let finalId = clean.youtubeId || clean.id;
+
+    // Aseguramos formato de ID pendiente si no es de YouTube
     if (!clean.youtubeId && !String(finalId).startsWith('pending-') && String(finalId).length !== 11) {
       finalId = `pending-${finalId}`;
     }
+
+    // 1. INTENTO EN LA NUBE (Si hay usuario)
+    if (user && !String(playlistId).startsWith('local-')) {
+      try {
+        const { error } = await supabase.from('playlist_items').insert([{
+          playlist_id: playlistId,
+          song_id: finalId,
+          title: clean.title,
+          artist: clean.artist,
+          thumbnail: clean.thumbnail
+        }]);
+
+        if (!error) {
+          await loadUserData(); // Recargar de la nube
+          return { success: true, mode: 'cloud' };
+        }
+        // Si hay error (como el 400 que te salía), no hacemos throw, pasamos al modo local
+        console.warn("Error en Supabase, reintentando guardar localmente...");
+      } catch (e) {
+        console.error("Fallo de conexión con la nube:", e);
+      }
+    }
+
+    // 2. FALLBACK: GUARDADO LOCAL (Si no hay usuario, es playlist local o falló la nube)
     try {
-      const { error } = await supabase.from('playlist_items').insert([{
-        playlist_id: playlistId,
-        song_id: finalId,
-        title: clean.title,
-        artist: clean.artist,
-        thumbnail: clean.thumbnail
-      }]);
-      if (error) throw error;
-      await loadUserData();
-      return { success: true };
-    } catch (e) { return { success: false, error: e.message }; }
+      const updatedLocal = localPlaylists.map(pl => {
+        if (pl.id === playlistId) {
+          const newItem = {
+            id: `local-item-${Math.random()}`,
+            playlist_id: playlistId,
+            song_id: finalId,
+            title: clean.title,
+            artist: clean.artist,
+            thumbnail: clean.thumbnail,
+            created_at: new Date().toISOString()
+          };
+          return { ...pl, playlist_items: [...(pl.playlist_items || []), newItem] };
+        }
+        return pl;
+      });
+
+      setLocalPlaylists(updatedLocal);
+      localStorage.setItem('klang_local_playlists', JSON.stringify(updatedLocal));
+      
+      // Forzar actualización visual
+      setMyPlaylists(updatedLocal);
+      
+      if (window.electron) window.electron.ipcRenderer.send('terminal-log', `💾 Canción guardada localmente en playlist: ${playlistId}`);
+      return { success: true, mode: 'local' };
+    } catch (localError) {
+      return { success: false, error: localError.message };
+    }
   };
 
   const startAutoLinking = useCallback(async (playlistId) => {
     const playlist = myPlaylists.find(pl => pl.id === playlistId);
     if (!playlist) return;
 
+    const isLocal = String(playlistId).startsWith('local-');
     const pendingTracks = playlist.playlist_items.filter(item => 
-      String(item.song_id).startsWith('pending-')
+        String(item.song_id || item.id).startsWith('pending-')
     );
 
+    if (pendingTracks.length === 0) return;
+
+    // Usamos una referencia local para ir acumulando cambios y actualizar la UI paso a paso
+    let currentItems = [...(playlist.playlist_items || [])];
+
     for (const item of pendingTracks) {
-      const foundId = await searchYouTubeId(item.title, item.artist);
-      if (foundId) {
-        await supabase.from('playlist_items').update({ song_id: foundId }).eq('id', item.id);
-        if (window.electron) window.electron.ipcRenderer.send('terminal-log', `🔗 Vinculado: ${item.title}`);
-      }
-      await new Promise(r => setTimeout(r, 1000));
+        try {
+            const foundId = await searchYouTubeId(item.title, item.artist);
+            
+            if (foundId) {
+                // 1. Actualización en Nube (si aplica)
+                if (user && !isLocal) {
+                    await supabase
+                        .from('playlist_items')
+                        .update({ song_id: foundId })
+                        .eq('id', item.id);
+                } 
+                
+                // 2. Actualización en Memoria (para feedback instantáneo)
+                currentItems = currentItems.map(track => 
+                    track.id === item.id 
+                    ? { ...track, song_id: foundId, id: foundId } 
+                    : track
+                );
+
+                // Sincronizamos el estado global para que PlaylistView reaccione YA
+                setMyPlaylists(prev => prev.map(pl => 
+                    pl.id === playlistId ? { ...pl, playlist_items: currentItems } : pl
+                ));
+
+                if (window.electron) {
+                    window.electron.ipcRenderer.send('terminal-log', `🔗 Vinculado: ${item.title}`);
+                }
+            }
+        } catch (err) {
+            console.error("Error vinculando track:", item.title, err);
+        }
+        
+        // Delay para no saturar la API
+        await new Promise(r => setTimeout(r, 600)); 
     }
-    loadUserData();
-  }, [myPlaylists, searchYouTubeId, loadUserData]);
+
+    // 3. Persistencia Final (LocalStorage)
+    if (isLocal || !user) {
+        const updatedLocal = localPlaylists.map(pl => 
+            pl.id === playlistId ? { ...pl, playlist_items: currentItems } : pl
+        );
+        setLocalPlaylists(updatedLocal);
+        localStorage.setItem('klang_local_playlists', JSON.stringify(updatedLocal));
+    } else {
+        // Refresco final de seguridad para modo nube
+        loadUserData();
+    }
+}, [myPlaylists, searchYouTubeId, loadUserData, user, localPlaylists]);
+
+  //const startAutoLinking = useCallback(async (playlistId) => {
+  //  const playlist = myPlaylists.find(pl => pl.id === playlistId);
+  //  if (!playlist) return;
+
+  //  const pendingTracks = playlist.playlist_items.filter(item => 
+  //    String(item.song_id).startsWith('pending-')
+  //  );
+
+  //  for (const item of pendingTracks) {
+  //    const foundId = await searchYouTubeId(item.title, item.artist);
+  //    if (foundId) {
+  //      await supabase.from('playlist_items').update({ song_id: foundId }).eq('id', item.id);
+  //      if (window.electron) window.electron.ipcRenderer.send('terminal-log', `🔗 Vinculado: ${item.title}`);
+  //    }
+  //    await new Promise(r => setTimeout(r, 1000));
+  //  }
+  //  loadUserData();
+  //}, [myPlaylists, searchYouTubeId, loadUserData]);
 
   const seek = useCallback((t) => {
     const audio = audioRef.current;
@@ -599,10 +756,12 @@ export function PlayerProvider({ children }) {
   }, [playIndex]);
 
   const createPlaylist = async (name, tracks = []) => {
-    const newPlaylist = {
-      id: `local-${Date.now()}`, // ID único local
+    // Definimos el objeto local por si la nube falla
+    const localId = `local-${Date.now()}`;
+    const newLocalPlaylist = {
+      id: localId,
       name,
-      user_id: 'guest',
+      user_id: user ? user.id : 'guest',
       created_at: new Date().toISOString(),
       playlist_items: tracks.map(t => ({
         ...t,
@@ -611,32 +770,54 @@ export function PlayerProvider({ children }) {
       }))
     };
 
-    if (!user) {
-      // MODO LOCAL
-      const updated = [newPlaylist, ...localPlaylists];
-      setLocalPlaylists(updated);
-      localStorage.setItem('klang_local_playlists', JSON.stringify(updated));
-      setIsGuest(true);
-      await loadUserData();
-      return newPlaylist;
-    } else {
-      // MODO SUPABASE (Tu código original)
+    // 1. INTENTO EN LA NUBE (Solo si hay usuario logueado)
+    if (user) {
       try {
-        const { data: playlist, error } = await supabase.from('playlists').insert([{ name, user_id: user.id }]).select().single();
-        if (error) throw error;
+        const { data: playlist, error } = await supabase
+          .from('playlists')
+          .insert([{ name, user_id: user.id }])
+          .select()
+          .single();
+
+        if (error) throw error; // Forzamos el salto al catch si hay error de DB
+
+        // Si la playlist se creó y hay canciones, las insertamos
         if (tracks.length > 0) {
           const items = tracks.map(t => ({
             playlist_id: playlist.id,
-            song_id: t.song_id,
+            song_id: t.song_id || t.youtubeId || t.id,
             title: t.title,
             artist: t.artist,
             thumbnail: t.thumbnail
           }));
-          await supabase.from('playlist_items').insert(items);
+          const { error: itemsError } = await supabase.from('playlist_items').insert(items);
+          if (itemsError) console.warn("Error insertando items en la nube, pero la playlist se creó.");
         }
+
         await loadUserData(user.id);
+        if (window.electron) window.electron.ipcRenderer.send('terminal-log', `☁️ Playlist "${name}" creada en Supabase`);
         return playlist;
-      } catch (e) { return null; }
+
+      } catch (e) {
+        console.warn("⚠️ Fallo al crear playlist en la nube. Creando copia local de emergencia...", e.message);
+        // No retornamos aquí para que continúe a la lógica local de abajo
+      }
+    }
+
+    // 2. FALLBACK: CREACIÓN LOCAL (Si no hay usuario o falló la nube)
+    try {
+      const updatedLocal = [newLocalPlaylist, ...localPlaylists];
+      setLocalPlaylists(updatedLocal);
+      setMyPlaylists(updatedLocal); // Actualización visual inmediata
+      localStorage.setItem('klang_local_playlists', JSON.stringify(updatedLocal));
+
+      if (window.electron) {
+        window.electron.ipcRenderer.send('terminal-log', `💾 Playlist "${name}" guardada en el almacenamiento local`);
+      }
+      return newLocalPlaylist;
+    } catch (localError) {
+      console.error("Error crítico: Ni siquiera se pudo guardar en local", localError);
+      return null;
     }
   };
 
@@ -718,12 +899,49 @@ export function PlayerProvider({ children }) {
     }
   }, [loadUserData]);
 
+  const playSearchResult = useCallback((track, results) => {
+    if (!results || results.length === 0) return;
+    
+    // Encontramos el índice de la canción elegida dentro de los resultados
+    const index = results.findIndex(t => (t.song_id || t.id) === (track.song_id || track.id));
+    
+    // Seteamos la cola con los resultados de la búsqueda
+    setQueueAndPlay(results, index >= 0 ? index : 0);
+    
+    if (window.electron) {
+      window.electron.ipcRenderer.send('terminal-log', `🔍 Reproduciendo desde búsqueda local: ${track.title}`);
+    }
+  }, [setQueueAndPlay]);
+
   useEffect(() => {
     if (!user || isGuest) {
       setMyPlaylists(localPlaylists);
       setPlaylists(localPlaylists);
     }
   }, [localPlaylists, user, isGuest]);
+
+  useEffect(() => {
+    const timer = setTimeout(() => {
+      if (!searchQuery.trim()) {
+        setSearchResults([]);
+        return;
+      }
+
+      const query = searchQuery.toLowerCase();
+      const tracksInPlaylists = localPlaylists.flatMap(pl => pl.playlist_items || []);
+      const allLocalTracks = [...tracksInPlaylists, ...localFavorites];
+
+      const filtered = allLocalTracks.filter(track => 
+        track.title?.toLowerCase().includes(query) || 
+        track.artist?.toLowerCase().includes(query)
+      );
+
+      const uniqueResults = Array.from(new Map(filtered.map(item => [item.song_id || item.id, item])).values());
+      setSearchResults(uniqueResults);
+    }, 150); // 150ms de respiro para la CPU
+
+    return () => clearTimeout(timer);
+  }, [searchQuery, localPlaylists, localFavorites]);
 
   if (isBanned === true) {
     return (
@@ -755,6 +973,8 @@ export function PlayerProvider({ children }) {
       },
       settings, updateSetting,
       showWaveform, toggleWaveform,
+      searchResults,
+      playSearchResult,
       isGuest, setIsGuest, enterAsGuest,
       currentTrack: queue[currentIndex] ? normalizeTrackData(queue[currentIndex]) : null,
       favorites, favoriteTracks, toggleFavorite,

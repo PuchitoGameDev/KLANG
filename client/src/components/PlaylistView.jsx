@@ -8,7 +8,8 @@ export default function PlaylistView({ playlist: initialPlaylist, onBack }) {
     const { 
         setQueueAndPlay, 
         updatePlaylistName, 
-        deletePlaylist, 
+        deletePlaylist,
+        user,
         myPlaylists, 
         startAutoLinking 
     } = usePlayer();
@@ -36,26 +37,30 @@ export default function PlaylistView({ playlist: initialPlaylist, onBack }) {
 
     const getNormalizedTracks = () => tracks.map(t => {
         const finalId = t.song_id || t.id;
+        const isPending = String(finalId).startsWith('pending-');
+        
         return {
             ...t,
             artist: t.artist || t.author || "Artista desconocido",
             id: finalId,
-            // Aseguramos que el reproductor reconozca el ID de YouTube
-            youtubeId: String(finalId).startsWith('pending-') ? null : finalId
+            youtubeId: isPending ? null : finalId,
+            isPending: isPending // Añadimos esta bandera para el filtro
         };
     });
 
     const handlePlayAll = () => {
-        if (tracks.length === 0) return;
+        const allTracks = getNormalizedTracks();
+        
+        // Buscamos el índice de la primera canción que YA esté vinculada
+        const firstValidIndex = allTracks.findIndex(t => !t.isPending);
 
-        // Normalizamos y filtramos tracks que no tengan ID válido si es necesario,
-        // aunque lo ideal es pasarle todo y que el reproductor gestione el "pending"
-        const tracksToPlay = getNormalizedTracks();
-        
-        console.log("Reproduciendo lista completa:", tracksToPlay);
-        
-        // Forzamos el inicio desde la primera canción (índice 0)
-        setQueueAndPlay(tracksToPlay, 0);
+        if (firstValidIndex === -1) {
+            alert("Primero debes vincular las canciones (botón del rayo ⚡)");
+            return;
+        }
+
+        console.log(`Reproduciendo desde la canción #${firstValidIndex + 1}`);
+        setQueueAndPlay(allTracks, firstValidIndex);
     };
 
     // --- ACCIONES NATIVAS ---
@@ -70,6 +75,19 @@ export default function PlaylistView({ playlist: initialPlaylist, onBack }) {
         setShowDeleteModal(false);
         onBack(); 
         await deletePlaylist(currentPlaylist.id);
+    };
+
+    const handleDelete = async (e, playlistId) => {
+        e.stopPropagation(); // Evita que se reproduzca la playlist al intentar borrarla
+        
+        if (window.confirm("¿Estás seguro de que quieres eliminar esta playlist?")) {
+            const result = await deletePlaylist(playlistId);
+            if (result.success) {
+                console.log("Playlist eliminada con éxito");
+            } else {
+                alert("No se pudo eliminar la playlist");
+            }
+        }
     };
 
     const handleLinkAll = async () => {

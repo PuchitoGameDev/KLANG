@@ -59,6 +59,7 @@ export function PlayerProvider({ children }) {
   const [searchResults, setSearchResults] = useState([]);
   const [isQueueOpen, setIsQueueOpen] = useState(false);
   const [isLoading, setIsLoading] = useState(true);
+  const linkingLogRef = useRef(new Set());
   
 
   const [currentBandeTracks, setCurrentBandeTracks] = useState([]);
@@ -194,49 +195,70 @@ export function PlayerProvider({ children }) {
   };
 
   const playIndex = useCallback(async (index) => {
+    // 1. Validaciones iniciales
     const tracks = queueRef.current;
     const rawTrack = tracks[index];
     if (!rawTrack) return;
 
+    // Normalización y obtención de ID
     let track = normalizeTrackData(rawTrack);
     let trackId = track.youtubeId || track.song_id || track.id;
     const audio = audioRef.current;
-    
-    // Detenemos cualquier carga previa inmediatamente
-    audio.pause();
 
-    if (String(trackId).startsWith('pending-')) {
-      const tempId = trackId;
-      const foundId = await searchYouTubeId(track.title, track.artist);
-      
-      if (foundId) {
-        trackId = foundId;
-        const newQueue = [...tracks];
-        newQueue[index] = { ...rawTrack, youtubeId: foundId, id: foundId, song_id: foundId };
-        setQueue(newQueue);
-        queueRef.current = newQueue; 
-        track = normalizeTrackData(newQueue[index]);
-        syncTrackIdToSupabase(tempId, foundId);
-      } else {
-        if (index + 1 < tracks.length) return playIndex(index + 1);
+    // Reset de estados previo a la carga
+    audio.pause();
+    setIsPlaying(false);
+
+    // 2. Manejo de IDs pendientes (Solo busca si realmente es necesario)
+    // Si el track ya viene de una búsqueda o ya fue resuelto antes (_resolved), saltamos esto.
+    if (!trackId || String(trackId).startsWith('pending-')) {
+      if (window.electron) window.electron.ipcRenderer.send('terminal-log', `🔍 Resolviendo ID para: ${track.title}...`);
+      try {
+        const foundId = await searchYouTubeId(track.title, track.artist);
+        if (foundId) {
+          trackId = foundId;
+          const nQ = [...queueRef.current];
+          const updatedTrack = { 
+            ...rawTrack, 
+            id: foundId, 
+            song_id: foundId, 
+            youtubeId: foundId,
+            _resolved: true 
+          };
+          nQ[index] = updatedTrack;
+          queueRef.current = nQ;
+          setQueue(nQ);
+          track = normalizeTrackData(updatedTrack);
+        } else {
+          console.warn("⚠️ No se encontró ID, saltando...");
+          if (index + 1 < tracks.length) return playIndex(index + 1);
+          return;
+        }
+      } catch (searchError) {
+        console.error("❌ Error en búsqueda:", searchError);
         return;
       }
     }
 
+    // --- PERSISTENCIA DE SESIÓN ---
+    localStorage.setItem('klang_current_queue', JSON.stringify(queueRef.current));
+    localStorage.setItem('klang_current_index', index.toString());
+
+    // 3. Intento de Reproducción Principal
     try {
       await ensureAudioGraph();
-      const qualityParam = settings.quality === 'low' ? '&quality=low' : settings.quality === 'medium' ? '&quality=medium' : '';
-      const newSrc = `http://localhost:5002/api/stream?id=${trackId}${qualityParam}`;
+      
+      const quality = settings.quality || 'medium';
+      // Añadimos un pequeño timestamp para evitar cacheos corruptos del navegador
+      const newSrc = `http://localhost:5002/api/stream?id=${trackId}&quality=${quality}`;
 
-      // SOLO cargamos si la fuente es distinta para evitar interrupciones innecesarias
       if (audio.src !== newSrc) {
         audio.src = newSrc;
-        audio.load(); // Forzamos carga limpia
+        audio.preload = "auto"; // Ayuda al navegador a priorizar la descarga
       }
 
-      audio.playbackRate = settings.playbackSpeed;
+      audio.playbackRate = settings.playbackSpeed || 1;
 
-      // MANEJO DE PROMESA SEGURO
       const playPromise = audio.play();
       if (playPromise !== undefined) {
         playPromise
@@ -244,71 +266,150 @@ export function PlayerProvider({ children }) {
             setIsPlaying(true);
             setCurrentIndex(index);
             currentIndexRef.current = index;
+            audio.dataset.retrying = 'false';
             updateSocialStatus(track);
-          })
-          .catch(err => {
-            if (err.name === 'AbortError') {
-              console.log("Klang: Carga interrumpida por nueva petición.");
-            } else {
-              console.error("Error real de audio:", err);
+
+            // --- TRUCO SPOTIFY: Pre-cargar la siguiente canción ---
+            if (index + 1 < tracks.length) {
+              const nextTrack = tracks[index + 1];
+              const nextId = nextTrack.youtubeId || nextTrack.song_id || nextTrack.id;
+              // Si el ID de la siguiente ya existe, el servidor empezará a cachearla
+              if (nextId && !String(nextId).startsWith('pending-')) {
+                const img = new Image();
+                img.src = `http://localhost:5002/api/stream?id=${nextId}&preload=true`; 
+                // Esto inicia una petición silenciosa al server para que vaya descargando
+              }
             }
+          })
+          .catch(async (err) => {
+            if (err.name === 'AbortError') return;
+
+            console.warn("⚠️ Error de stream. Reintentando con bypass...");
+
+            // 4. Lógica de Reintento con Bypass (Regla de los 2s)
+            if (audio.dataset.retrying === 'true') {
+              console.error("❌ Segundo fallo. Saltando.");
+              if (index + 1 < tracks.length) playIndex(index + 1);
+              return;
+            }
+
+            audio.dataset.retrying = 'true';
+
+            setTimeout(async () => {
+              if (currentIndexRef.current !== index && currentIndexRef.current !== -1) return;
+
+              // Bypass total: Forzamos al servidor a ignorar cualquier caché
+              const retrySrc = `http://localhost:5002/api/stream?id=${trackId}&nocache=true&t=${Date.now()}`;
+              audio.src = retrySrc;
+              
+              try {
+                await audio.play();
+                setIsPlaying(true);
+                setCurrentIndex(index);
+                currentIndexRef.current = index;
+                audio.dataset.retrying = 'false';
+              } catch (retryErr) {
+                audio.dataset.retrying = 'false';
+                if (index + 1 < tracks.length) playIndex(index + 1);
+              }
+            }, 1500); // Bajado a 1.5s para mayor agilidad
           });
       }
-
-      if (settings.showNotifications && "Notification" in window && Notification.permission === "granted") {
-        new Notification("Klang", { body: `${track.title} - ${track.artist}`, icon: track.thumbnail, silent: true });
-      }
-    } catch (err) { 
-      console.error("Error en flujo playIndex:", err);
+    } catch (err) {
+      console.error("🔥 Error crítico:", err);
+      setIsPlaying(false);
     }
-  }, [settings.quality, settings.playbackSpeed, settings.showNotifications, normalizeTrackData, searchYouTubeId, updateSocialStatus]);
+  }, [
+    settings.quality, 
+    settings.playbackSpeed, 
+    normalizeTrackData, 
+    searchYouTubeId, 
+    updateSocialStatus, 
+    ensureAudioGraph
+  ]);
 
   const setQueueAndPlay = useCallback((tracks, start = 0) => {
     if (!tracks || !tracks.length) return;
 
+    // 1. Parada de emergencia y limpieza de buffer
     audioRef.current.pause();
-    audioRef.current.src = "";
+    audioRef.current.src = ""; // Liberamos la conexión de red actual inmediatamente
+    audioRef.current.load();   // Fuerza al navegador a olvidar el stream anterior
 
+    // 2. Sincronización de estados (React + Referencias)
+    // Usamos las referencias para que playIndex tenga los datos frescos sin esperar al re-render
     setQueue(tracks);
     setCurrentIndex(start);
     queueRef.current = tracks;
     currentIndexRef.current = start;
 
+    // 3. Ejecución inmediata
+    // Usamos un micro-task (setTimeout 0) para permitir que React procese el cambio de cola
+    // antes de que playIndex intente acceder a los nuevos tracks.
     setTimeout(async () => {
       try {
         await ensureAudioGraph();
+        // Llamamos a playIndex con el índice inicial
         await playIndex(start);
       } catch (err) {
-        console.error("Autoplay failed:", err);
+        console.error("❌ Autoplay failed:", err);
       }
     }, 0);
   }, [playIndex]);
 
   // --- 8. VINCULACIÓN PROACTIVA (PRE-LINKER) ---
+
+  const prefetchCooldownRef = useRef(false);
+
+  const silentPrefetch = useCallback((id) => {
+    if (!id || String(id).startsWith('pending-')) return;
+    
+    // Si el reproductor está cargando datos críticos, no molestamos al servidor
+    if (audioRef.current.networkState === 2) return; 
+
+    fetch(`http://localhost:5002/api/prefetch?id=${id}`, { 
+      priority: 'low' 
+    }).catch(() => {
+      // Silencio total ante errores de pre-carga
+    });
+  }, []);
+
   const preLinkNextTracks = useCallback(async () => {
     const currentQueue = queueRef.current;
     if (currentQueue.length === 0 || currentIndex === -1) return;
     
-    const range = [currentIndex + 1, currentIndex + 2, currentIndex + 3];
+    // ESPERAMOS 5 SEGUNDOS: Damos prioridad absoluta al buffer de la canción actual
+    setTimeout(async () => {
+      const range = [currentIndex + 1, currentIndex + 2];
 
-    await Promise.all(range.map(async (nextIdx) => {
-      const track = currentQueue[nextIdx];
-      if (track && String(track.song_id || "").startsWith('pending-')) {
-        const tempId = track.song_id;
-        const foundId = await searchYouTubeId(track.title, track.artist);
-        if (foundId) {
-          setQueue(prev => {
-            const updated = [...prev];
-            if (updated[nextIdx] && updated[nextIdx].song_id === tempId) {
-              updated[nextIdx] = { ...updated[nextIdx], id: foundId, youtubeId: foundId, song_id: foundId };
-            }
-            return updated;
-          });
-          syncTrackIdToSupabase(tempId, foundId);
+      for (const nextIdx of range) {
+        const track = currentQueue[nextIdx];
+        if (!track) continue;
+
+        const trackId = track.song_id || track.id;
+
+        if (String(trackId).startsWith('pending-')) {
+          const tempId = trackId;
+          const foundId = await searchYouTubeId(track.title, track.artist);
+          
+          if (foundId) {
+            setQueue(prev => {
+              const updated = [...prev];
+              if (updated[nextIdx] && (updated[nextIdx].song_id === tempId || updated[nextIdx].id === tempId)) {
+                updated[nextIdx] = { ...updated[nextIdx], id: foundId, youtubeId: foundId, song_id: foundId };
+              }
+              return updated;
+            });
+            syncTrackIdToSupabase(tempId, foundId);
+            silentPrefetch(foundId); 
+          }
+        } else if (trackId && !track._prefetchedServer) {
+          silentPrefetch(trackId);
+          track._prefetchedServer = true; 
         }
       }
-    }));
-  }, [currentIndex, searchYouTubeId]);
+    }, 5000); // El retraso de 5 seg evita el colapso inicial
+  }, [currentIndex, searchYouTubeId, silentPrefetch, syncTrackIdToSupabase]);
 
   // --- 11. PLAYLISTS Y FAVORITOS ---
   const loadUserData = useCallback(async (forcedUserId = null) => {
@@ -449,15 +550,18 @@ export function PlayerProvider({ children }) {
   useEffect(() => { currentIndexRef.current = currentIndex; }, [currentIndex]);
 
   useEffect(() => {
+    // Guardamos estado actual para persistencia
     localStorage.setItem('klang_current_queue', JSON.stringify(queue));
     localStorage.setItem('klang_current_index', JSON.stringify(currentIndex));
 
+    // Esperamos 1.5 segundos de estabilidad antes de empezar a trabajar en segundo plano
+    // para no robar ancho de banda a la canción que acaba de empezar.
     const timer = setTimeout(() => {
       preLinkNextTracks();
-    }, 2000); 
+    }, 1500); 
 
     return () => clearTimeout(timer);
-  }, [queue.length, currentIndex]);
+  }, [queue.length, currentIndex, preLinkNextTracks]);
 
   useEffect(() => {
     localStorage.setItem('klang_settings', JSON.stringify(settings));
@@ -469,7 +573,22 @@ export function PlayerProvider({ children }) {
     const audio = audioRef.current;
     
     const handleTimeUpdate = () => {
-      if (!audio.seeking) setCurrentTime(audio.currentTime);
+      if (!audio.seeking) {
+        setCurrentTime(audio.currentTime);
+
+        // Pre-carga agresiva: Si faltan menos de 45 segundos, despertamos la siguiente canción
+        const remaining = audio.duration - audio.currentTime;
+        if (remaining > 0 && remaining < 45) {
+          const nextTrack = queueRef.current[currentIndexRef.current + 1];
+          if (nextTrack) {
+            const nextId = nextTrack.youtubeId || nextTrack.song_id || nextTrack.id;
+            if (nextId && !String(nextId).startsWith('pending-') && !nextTrack._prefetchedServer) {
+              silentPrefetch(nextId);
+              nextTrack._prefetchedServer = true; 
+            }
+          }
+        }
+      }
     };
 
     const handleLoadedMetadata = () => setDuration(audio.duration);
@@ -482,16 +601,27 @@ export function PlayerProvider({ children }) {
       }
     };
 
+    const handleError = (e) => {
+      console.error("Fallo de stream");
+      // Detener si hay demasiados fallos seguidos
+      if (retryCount > 2) {
+          stopPlayback();
+          alert("Error de conexión. Revisa los binarios o cookies.");
+      }
+    };
+
     audio.addEventListener('timeupdate', handleTimeUpdate);
     audio.addEventListener('loadedmetadata', handleLoadedMetadata);
     audio.addEventListener('ended', handleEnded);
+    audio.addEventListener('error', handleError);
 
     return () => {
       audio.removeEventListener('timeupdate', handleTimeUpdate);
       audio.removeEventListener('loadedmetadata', handleLoadedMetadata);
       audio.removeEventListener('ended', handleEnded);
+      audio.removeEventListener('error', handleError);
     };
-  }, [playIndex]);
+  }, [playIndex, isPlaying, silentPrefetch]);
 
   useEffect(() => { audioRef.current.volume = volume; }, [volume]);
   useEffect(() => {
@@ -578,130 +708,189 @@ export function PlayerProvider({ children }) {
   };
 
   const addTrackToPlaylist = async (playlistId, track) => {
-    const clean = normalizeTrackData(track);
-    let finalId = clean.youtubeId || clean.id;
+      const clean = normalizeTrackData(track);
+      let finalId = clean.youtubeId || clean.id;
 
-    // Aseguramos formato de ID pendiente si no es de YouTube
-    if (!clean.youtubeId && !String(finalId).startsWith('pending-') && String(finalId).length !== 11) {
-      finalId = `pending-${finalId}`;
-    }
-
-    // 1. INTENTO EN LA NUBE (Si hay usuario)
-    if (user && !String(playlistId).startsWith('local-')) {
-      try {
-        const { error } = await supabase.from('playlist_items').insert([{
-          playlist_id: playlistId,
-          song_id: finalId,
-          title: clean.title,
-          artist: clean.artist,
-          thumbnail: clean.thumbnail
-        }]);
-
-        if (!error) {
-          await loadUserData(); // Recargar de la nube
-          return { success: true, mode: 'cloud' };
-        }
-        // Si hay error (como el 400 que te salía), no hacemos throw, pasamos al modo local
-        console.warn("Error en Supabase, reintentando guardar localmente...");
-      } catch (e) {
-        console.error("Fallo de conexión con la nube:", e);
+      // Aseguramos formato de ID pendiente si no es de YouTube
+      if (!clean.youtubeId && !String(finalId).startsWith('pending-') && String(finalId).length !== 11) {
+        finalId = `pending-${finalId}`;
       }
-    }
 
-    // 2. FALLBACK: GUARDADO LOCAL (Si no hay usuario, es playlist local o falló la nube)
-    try {
-      const updatedLocal = localPlaylists.map(pl => {
-        if (pl.id === playlistId) {
-          const newItem = {
-            id: `local-item-${Math.random()}`,
+      // 1. INTENTO EN LA NUBE (Si hay usuario)
+      if (user && !String(playlistId).startsWith('local-')) {
+        try {
+          const { error } = await supabase.from('playlist_items').insert([{
             playlist_id: playlistId,
             song_id: finalId,
             title: clean.title,
             artist: clean.artist,
-            thumbnail: clean.thumbnail,
-            created_at: new Date().toISOString()
-          };
-          return { ...pl, playlist_items: [...(pl.playlist_items || []), newItem] };
-        }
-        return pl;
-      });
+            thumbnail: clean.thumbnail
+          }]);
 
+          if (!error) {
+            await loadUserData(); // Recargar de la nube
+            
+            // --- AUTO-VINCULACIÓN AUTOMÁTICA ---
+            if (String(finalId).startsWith('pending-')) {
+                startAutoLinking(playlistId);
+            }
+            
+            return { success: true, mode: 'cloud' };
+          }
+          // Si hay error (como el 400 que te salía), no hacemos throw, pasamos al modo local
+          console.warn("Error en Supabase, reintentando guardar localmente...");
+        } catch (e) {
+          console.error("Fallo de conexión con la nube:", e);
+        }
+      }
+
+      // 2. FALLBACK: GUARDADO LOCAL (Si no hay usuario, es playlist local o falló la nube)
+      try {
+        const updatedLocal = localPlaylists.map(pl => {
+          if (pl.id === playlistId) {
+            const newItem = {
+              id: `local-item-${Math.random()}`,
+              playlist_id: playlistId,
+              song_id: finalId,
+              title: clean.title,
+              artist: clean.artist,
+              thumbnail: clean.thumbnail,
+              created_at: new Date().toISOString()
+            };
+            return { ...pl, playlist_items: [...(pl.playlist_items || []), newItem] };
+          }
+          return pl;
+        });
+
+        setLocalPlaylists(updatedLocal);
+        localStorage.setItem('klang_local_playlists', JSON.stringify(updatedLocal));
+        
+        // Forzar actualización visual
+        setMyPlaylists(updatedLocal);
+        
+        if (window.electron) window.electron.ipcRenderer.send('terminal-log', `💾 Canción guardada localmente en playlist: ${playlistId}`);
+
+        // --- AUTO-VINCULACIÓN AUTOMÁTICA ---
+        if (String(finalId).startsWith('pending-')) {
+            startAutoLinking(playlistId);
+        }
+
+        return { success: true, mode: 'local' };
+      } catch (localError) {
+        return { success: false, error: localError.message };
+      }
+  };
+
+  const deletePlaylist = async (playlistId) => {
+    // 1. DETERMINAR SI ES LOCAL O NUBE
+    const isLocal = String(playlistId).startsWith('local-');
+
+    // 2. LÓGICA PARA MODO NUBE (Si hay usuario y no es ID local)
+    if (user && !isLocal) {
+      try {
+        if (window.electron) window.electron.ipcRenderer.send('terminal-log', `☁️ Eliminando playlist de la nube: ${playlistId}`);
+        
+        const { error } = await supabase
+          .from('playlists')
+          .delete()
+          .eq('id', playlistId)
+          .eq('user_id', user.id);
+
+        if (error) throw error;
+        
+        // Refrescamos datos de la nube
+        await loadUserData();
+        return { success: true };
+      } catch (e) {
+        console.error("Error eliminando en nube:", e);
+        // Si falla la nube, no hacemos nada más para evitar borrar algo que sigue ahí
+        return { success: false, error: e.message };
+      }
+    }
+
+    // 3. LÓGICA PARA MODO LOCAL / INVITADO
+    try {
+      if (window.electron) window.electron.ipcRenderer.send('terminal-log', `🗑️ Borrando playlist local: ${playlistId}`);
+      
+      const updatedLocal = localPlaylists.filter(pl => pl.id !== playlistId);
+      
+      // Actualizamos estado y persistencia
       setLocalPlaylists(updatedLocal);
       localStorage.setItem('klang_local_playlists', JSON.stringify(updatedLocal));
       
-      // Forzar actualización visual
+      // Actualizamos la UI inmediatamente
       setMyPlaylists(updatedLocal);
+      setPlaylists(updatedLocal);
       
-      if (window.electron) window.electron.ipcRenderer.send('terminal-log', `💾 Canción guardada localmente en playlist: ${playlistId}`);
-      return { success: true, mode: 'local' };
-    } catch (localError) {
-      return { success: false, error: localError.message };
+      return { success: true };
+    } catch (e) {
+      console.error("Error eliminando local:", e);
+      return { success: false };
     }
   };
 
   const startAutoLinking = useCallback(async (playlistId) => {
-    const playlist = myPlaylists.find(pl => pl.id === playlistId);
-    if (!playlist) return;
+    if (linkingLogRef.current.has(playlistId)) return;
+    linkingLogRef.current.add(playlistId);
 
-    const isLocal = String(playlistId).startsWith('local-');
-    const pendingTracks = playlist.playlist_items.filter(item => 
+    try {
+      const playlist = myPlaylists.find(pl => pl.id === playlistId);
+      if (!playlist || !playlist.playlist_items) return;
+
+      const isLocal = String(playlistId).startsWith('local-');
+      const pendingTracks = playlist.playlist_items.filter(item => 
         String(item.song_id || item.id).startsWith('pending-')
-    );
+      );
 
-    if (pendingTracks.length === 0) return;
+      if (pendingTracks.length === 0) return;
 
-    // Usamos una referencia local para ir acumulando cambios y actualizar la UI paso a paso
-    let currentItems = [...(playlist.playlist_items || [])];
+      let updatedPlaylistItems = [...playlist.playlist_items];
 
-    for (const item of pendingTracks) {
+      for (const item of pendingTracks) {
         try {
-            const foundId = await searchYouTubeId(item.title, item.artist);
-            
-            if (foundId) {
-                // 1. Actualización en Nube (si aplica)
-                if (user && !isLocal) {
-                    await supabase
-                        .from('playlist_items')
-                        .update({ song_id: foundId })
-                        .eq('id', item.id);
-                } 
-                
-                // 2. Actualización en Memoria (para feedback instantáneo)
-                currentItems = currentItems.map(track => 
-                    track.id === item.id 
-                    ? { ...track, song_id: foundId, id: foundId } 
-                    : track
-                );
+          const foundId = await searchYouTubeId(item.title, item.artist);
+          
+          if (foundId) {
+            // 1. Actualización en memoria (UI inmediata)
+            updatedPlaylistItems = updatedPlaylistItems.map(track => 
+              (track.id === item.id || track.song_id === item.song_id)
+              ? { ...track, song_id: foundId, id: foundId, youtubeId: foundId, _linked: true }
+              : track
+            );
 
-                // Sincronizamos el estado global para que PlaylistView reaccione YA
-                setMyPlaylists(prev => prev.map(pl => 
-                    pl.id === playlistId ? { ...pl, playlist_items: currentItems } : pl
-                ));
+            setMyPlaylists(prev => prev.map(pl => 
+              pl.id === playlistId ? { ...pl, playlist_items: updatedPlaylistItems } : pl
+            ));
 
-                if (window.electron) {
-                    window.electron.ipcRenderer.send('terminal-log', `🔗 Vinculado: ${item.title}`);
-                }
+            // 2. Persistencia en Nube
+            if (user && !isLocal) {
+              await supabase.from('playlist_items').update({ song_id: foundId }).eq('id', item.id);
+              if (window.electron) window.electron.ipcRenderer.send('terminal-log', `🔗 Vinculado (Cloud): ${item.title}`);
             }
+          }
         } catch (err) {
-            console.error("Error vinculando track:", item.title, err);
+          console.warn(`Error vinculando track:`, err);
         }
-        
-        // Delay para no saturar la API
-        await new Promise(r => setTimeout(r, 600)); 
-    }
+        await new Promise(r => setTimeout(r, 250)); // Delay para evitar 429 (Too Many Requests)
+      }
 
-    // 3. Persistencia Final (LocalStorage)
-    if (isLocal || !user) {
-        const updatedLocal = localPlaylists.map(pl => 
-            pl.id === playlistId ? { ...pl, playlist_items: currentItems } : pl
+      // 3. Persistencia Final Local
+      if (isLocal || !user) {
+        const savedLocals = JSON.parse(localStorage.getItem('klang_local_playlists') || '[]');
+        const finalLocal = savedLocals.map(pl => 
+          pl.id === playlistId ? { ...pl, playlist_items: updatedPlaylistItems } : pl
         );
-        setLocalPlaylists(updatedLocal);
-        localStorage.setItem('klang_local_playlists', JSON.stringify(updatedLocal));
-    } else {
-        // Refresco final de seguridad para modo nube
-        loadUserData();
+        setLocalPlaylists(finalLocal);
+        localStorage.setItem('klang_local_playlists', JSON.stringify(finalLocal));
+        if (window.electron) window.electron.ipcRenderer.send('terminal-log', `💾 Cambios guardados en local storage`);
+      }
+
+    } catch (e) {
+      console.error("Error crítico en AutoLinking:", e);
+    } finally {
+      linkingLogRef.current.delete(playlistId);
     }
-}, [myPlaylists, searchYouTubeId, loadUserData, user, localPlaylists]);
+  }, [myPlaylists, searchYouTubeId, user]);
 
   //const startAutoLinking = useCallback(async (playlistId) => {
   //  const playlist = myPlaylists.find(pl => pl.id === playlistId);
@@ -756,7 +945,6 @@ export function PlayerProvider({ children }) {
   }, [playIndex]);
 
   const createPlaylist = async (name, tracks = []) => {
-    // Definimos el objeto local por si la nube falla
     const localId = `local-${Date.now()}`;
     const newLocalPlaylist = {
       id: localId,
@@ -765,60 +953,50 @@ export function PlayerProvider({ children }) {
       created_at: new Date().toISOString(),
       playlist_items: tracks.map(t => ({
         ...t,
-        id: `item-${Math.random()}`,
+        id: `item-${Math.random().toString(36).substr(2, 9)}`,
         created_at: new Date().toISOString()
       }))
     };
 
-    // 1. INTENTO EN LA NUBE (Solo si hay usuario logueado)
+    // 1. INTENTO EN LA NUBE
     if (user) {
       try {
         const { data: playlist, error } = await supabase
           .from('playlists')
           .insert([{ name, user_id: user.id }])
-          .select()
-          .single();
+          .select().single();
 
-        if (error) throw error; // Forzamos el salto al catch si hay error de DB
+        if (error) throw error;
 
-        // Si la playlist se creó y hay canciones, las insertamos
         if (tracks.length > 0) {
           const items = tracks.map(t => ({
             playlist_id: playlist.id,
-            song_id: t.song_id || t.youtubeId || t.id,
+            song_id: t.song_id || t.id,
             title: t.title,
             artist: t.artist,
             thumbnail: t.thumbnail
           }));
-          const { error: itemsError } = await supabase.from('playlist_items').insert(items);
-          if (itemsError) console.warn("Error insertando items en la nube, pero la playlist se creó.");
+          await supabase.from('playlist_items').insert(items);
         }
 
         await loadUserData(user.id);
-        if (window.electron) window.electron.ipcRenderer.send('terminal-log', `☁️ Playlist "${name}" creada en Supabase`);
+        startAutoLinking(playlist.id);
         return playlist;
-
       } catch (e) {
-        console.warn("⚠️ Fallo al crear playlist en la nube. Creando copia local de emergencia...", e.message);
-        // No retornamos aquí para que continúe a la lógica local de abajo
+        console.warn("⚠️ Error en nube, creando copia local...", e.message);
       }
     }
 
-    // 2. FALLBACK: CREACIÓN LOCAL (Si no hay usuario o falló la nube)
-    try {
-      const updatedLocal = [newLocalPlaylist, ...localPlaylists];
-      setLocalPlaylists(updatedLocal);
-      setMyPlaylists(updatedLocal); // Actualización visual inmediata
-      localStorage.setItem('klang_local_playlists', JSON.stringify(updatedLocal));
+    // 2. FALLBACK LOCAL
+    const updatedLocal = [newLocalPlaylist, ...localPlaylists];
+    setLocalPlaylists(updatedLocal);
+    setMyPlaylists(updatedLocal);
+    localStorage.setItem('klang_local_playlists', JSON.stringify(updatedLocal));
 
-      if (window.electron) {
-        window.electron.ipcRenderer.send('terminal-log', `💾 Playlist "${name}" guardada en el almacenamiento local`);
-      }
-      return newLocalPlaylist;
-    } catch (localError) {
-      console.error("Error crítico: Ni siquiera se pudo guardar en local", localError);
-      return null;
-    }
+    if (window.electron) window.electron.ipcRenderer.send('terminal-log', `💾 Playlist "${name}" local activada`);
+    
+    startAutoLinking(localId);
+    return newLocalPlaylist;
   };
 
   const importSpotifyPlaylist = useCallback(async (playlistData) => {
@@ -902,14 +1080,25 @@ export function PlayerProvider({ children }) {
   const playSearchResult = useCallback((track, results) => {
     if (!results || results.length === 0) return;
     
-    // Encontramos el índice de la canción elegida dentro de los resultados
-    const index = results.findIndex(t => (t.song_id || t.id) === (track.song_id || track.id));
+    // OPTIMIZACIÓN: Marcamos los resultados como "ya resueltos" 
+    // para que playIndex no intente buscar el ID en YouTube de nuevo.
+    const optimizedResults = results.map(t => ({
+      ...t,
+      // Si viene de YouTube Search, el ID ya es el correcto
+      song_id: t.videoId || t.id || t.song_id,
+      youtubeId: t.videoId || t.id || t.song_id,
+      _resolved: true // Esta flag es la que hace que playIndex sea instantáneo
+    }));
+
+    // Encontramos el índice de la canción elegida usando el ID optimizado
+    const trackId = track.videoId || track.song_id || track.id;
+    const index = optimizedResults.findIndex(t => (t.song_id || t.id) === trackId);
     
-    // Seteamos la cola con los resultados de la búsqueda
-    setQueueAndPlay(results, index >= 0 ? index : 0);
+    // Seteamos la cola con los resultados ya "curados"
+    setQueueAndPlay(optimizedResults, index >= 0 ? index : 0);
     
     if (window.electron) {
-      window.electron.ipcRenderer.send('terminal-log', `🔍 Reproduciendo desde búsqueda local: ${track.title}`);
+      window.electron.ipcRenderer.send('terminal-log', `🔍 Reproducción instantánea desde búsqueda: ${track.title}`);
     }
   }, [setQueueAndPlay]);
 
@@ -939,6 +1128,34 @@ export function PlayerProvider({ children }) {
       const uniqueResults = Array.from(new Map(filtered.map(item => [item.song_id || item.id, item])).values());
       setSearchResults(uniqueResults);
     }, 150); // 150ms de respiro para la CPU
+
+    return () => clearTimeout(timer);
+  }, [searchQuery, localPlaylists, localFavorites]);
+
+  useEffect(() => {
+    const timer = setTimeout(() => {
+      if (!searchQuery.trim()) {
+        setSearchResults([]);
+        return;
+      }
+
+      const query = searchQuery.toLowerCase();
+      // Aplanamos todas las canciones disponibles en local
+      const tracksInPlaylists = localPlaylists.flatMap(pl => pl.playlist_items || []);
+      const allLocalTracks = [...tracksInPlaylists, ...localFavorites];
+
+      const filtered = allLocalTracks.filter(track => 
+        track.title?.toLowerCase().includes(query) || 
+        track.artist?.toLowerCase().includes(query)
+      );
+
+      // Eliminamos duplicados por ID
+      const uniqueResults = Array.from(
+        new Map(filtered.map(item => [item.song_id || item.id, item])).values()
+      );
+      
+      setSearchResults(uniqueResults);
+    }, 150); // Debounce para no saturar el render
 
     return () => clearTimeout(timer);
   }, [searchQuery, localPlaylists, localFavorites]);
@@ -975,6 +1192,7 @@ export function PlayerProvider({ children }) {
       showWaveform, toggleWaveform,
       searchResults,
       playSearchResult,
+      deletePlaylist,
       isGuest, setIsGuest, enterAsGuest,
       currentTrack: queue[currentIndex] ? normalizeTrackData(queue[currentIndex]) : null,
       favorites, favoriteTracks, toggleFavorite,

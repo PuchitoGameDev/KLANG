@@ -1,16 +1,25 @@
-// --- 1. IMPORTACIONES BÁSICAS ---
+// --- 1. OPTIMIZACIÓN CRÍTICA DE RED ---
+const dns = require('dns');
+// Solo aplicamos si estamos seguros, de lo contrario dejamos que Node decida
+if (typeof dns.setDefaultResultOrder === 'function') {
+    // Lo ejecutamos de forma asíncrona para no detener el arranque
+    setImmediate(() => {
+        try { dns.setDefaultResultOrder('ipv4first'); } catch(e) {}
+    });
+}
+
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const Discord = require('discord.js'); 
-const { getSuggestions, getArtistURL } = require('node-youtube-music');
+const { getSuggestions } = require('node-youtube-music');
 const { spawn } = require('child_process');
 const path = require('path');
 const https = require('https');
 const axios = require('axios');
 const fs = require('fs');
 
-// --- NUEVO MOTOR YOUTUBE MUSIC ---
+// --- MOTOR YOUTUBE MUSIC ---
 const YTMusicClass = require('ytmusic-api');
 const YTMusic = YTMusicClass.default ? YTMusicClass.default : YTMusicClass;
 const ytmusic = new YTMusic();
@@ -18,286 +27,403 @@ const ytmusic = new YTMusic();
 const app = express();
 const PORT = process.env.PORT || 5002;
 
-const urlCache = new Map();
+// --- 2. AGENTE HTTPS PERSISTENTE ---
+const httpsAgent = new https.Agent({
+    keepAlive: true,
+    keepAliveMsecs: 30000,
+    maxSockets: 100
+});
+
+
+// --- 2. CONFIGURACIÓN DE RUTAS Y CACHÉ PERSISTENTE ---
+
+// Detectar si estamos en Electron empaquetado
+const isProd = process.resourcesPath && process.resourcesPath.includes('resources');
+
+// RUTA DE BINARIOS: Aquí es donde fallaba. 
+// Usamos process.resourcesPath directamente si es prod.
+const basePath = isProd 
+    ? path.join(process.resourcesPath, 'app.asar.unpacked', 'server') 
+    : __dirname;
+
+// RUTA DE DATOS (Escritura):
+const userDataPath = isProd 
+    ? path.join(process.env.APPDATA || (process.platform == 'darwin' ? process.env.HOME + '/Library/Preferences' : process.env.HOME), 'KlangMusicCloud')
+    : __dirname;
+
+const CACHE_DIR = path.join(userDataPath, 'cache_data');
+const CACHE_FILE = path.join(CACHE_DIR, 'url_cache.json');
+
+try {
+    if (!fs.existsSync(CACHE_DIR)) {
+        fs.mkdirSync(CACHE_DIR, { recursive: true });
+    }
+} catch (err) {
+    console.error("❌ Error creando CACHE_DIR:", err);
+}
+
+console.log("🚀 Server Mode:", isProd ? "PRODUCTION" : "DEVELOPMENT");
+console.log("📂 Binarios path:", basePath);
+
+let urlCache = new Map();
+const pendingExtractions = new Map();
+
+// Cargar Caché
+if (fs.existsSync(CACHE_FILE)) {
+    try {
+        const data = JSON.parse(fs.readFileSync(CACHE_FILE, 'utf8'));
+        urlCache = new Map(Object.entries(data));
+        console.log(`📂 Caché cargado: ${urlCache.size} canciones.`);
+    } catch (e) { urlCache = new Map(); }
+}
+
+// Guardado de caché con Debounce (No bloqueante)
+let saveTimeout;
+function scheduleSaveCache() {
+    if (saveTimeout) clearTimeout(saveTimeout);
+    saveTimeout = setTimeout(() => {
+        try {
+            const obj = Object.fromEntries(urlCache);
+            fs.writeFileSync(CACHE_FILE, JSON.stringify(obj, null, 2));
+        } catch (e) { console.error("❌ Error guardando caché:", e.message); }
+    }, 10000);
+}
 
 app.use(cors());
 app.use(express.json());
 
-// --- 2. CONFIGURACIÓN DISCORD ---
-const client = new Discord.Client({ 
-    intents: [1, 32768, 33280],
-    partials: ['CHANNEL'] 
-});
+// --- 3. DISCORD ---
+const client = new Discord.Client({ intents: [1, 32768, 33280], partials: ['CHANNEL'] });
+client.once('ready', () => console.log(`✅ Klang Cloud: Conectado como ${client.user.tag}`));
+setTimeout(() => {
+    if (process.env.DISCORD_TOKEN) {
+        client.login(process.env.DISCORD_TOKEN).catch(e => console.error("❌ Discord Error:", e.message));
+    }
+}, 5000);
 
-client.once('ready', () => {
-    console.log(`✅ Klang Cloud: Conectado como ${client.user.tag}`);
-});
+// --- 4. EXTRACCIÓN URL (SOLO SEGUNDO PLANO) ---
+async function getYoutubeUrl(id) {
+    if (urlCache.has(id)) {
+        const cached = urlCache.get(id);
+        if (Date.now() < cached.expires) return cached.url;
+    }
+    if (pendingExtractions.has(id)) return pendingExtractions.get(id);
 
-client.login(process.env.DISCORD_TOKEN).catch(err => {
-    console.error("❌ Error de Login Discord:", err.message);
-});
+    const extractionPromise = new Promise((resolve, reject) => {
+        const ytDlpPath = path.join(basePath, 'yt-dlp.exe');
+        const cookiesPath = path.join(basePath, 'cookies.txt');
 
-// --- 3. MOTOR DE STREAMING (ULTRA-OPTIMIZADO CON RUTAS DINÁMICAS) ---
+        const args = [
+            '-g', `https://www.youtube.com/watch?v=${id}`,
+            '-f', '251/bestaudio',
+            '--no-check-certificate', 
+            '--no-warnings', 
+            '--quiet', 
+            '--no-playlist',
+            '--force-ipv4',
+            '--no-mtime'
+        ];
+        if (fs.existsSync(cookiesPath)) args.push('--cookies', cookiesPath);
+
+        const proc = spawn(ytDlpPath, args, { 
+            windowsHide: true,
+            detached: false, // IMPORTANTE: No lo desprendas para que muera con la app
+            stdio: ['ignore', 'pipe', 'ignore'], 
+            priority: 0 // Prioridad normal para no asfixiar a Electron
+        });
+        let output = '';
+        proc.stdout.on('data', d => output += d);
+        
+        proc.on('close', (code) => {
+            pendingExtractions.delete(id);
+            const url = output.trim();
+            if (code === 0 && url) {
+                // Guardamos URL por 3 horas
+                urlCache.set(id, { url, expires: Date.now() + (3 * 60 * 60 * 1000) });
+                scheduleSaveCache();
+                resolve(url);
+            } else {
+                reject(new Error(`yt-dlp falló (Code ${code})`));
+            }
+        });
+    });
+
+    pendingExtractions.set(id, extractionPromise);
+    return extractionPromise;
+}
+
+// --- 5. STREAMING "ZERO WAIT" (CERO ESPERA) ---
+
+app.get('/api/prefetch', async (req, res) => {
+    const { id } = req.query;
+    if (!id || urlCache.has(id)) return res.json({ status: "skipped" });
+    
+    // Aquí sí extraemos la URL para el futuro porque el usuario no está esperando
+    getYoutubeUrl(id).catch(() => {});
+    res.json({ status: "processing", id });
+});
 
 app.get('/api/stream', (req, res) => {
     const { id } = req.query;
-    if (!id) return res.status(400).send("Falta el ID del video");
+    if (!id) return res.status(400).send("Falta ID");
 
-    // DETECCIÓN DINÁMICA DE RUTAS PARA PRODUCCIÓN (.EXE)
-    // En el .exe instalado, los archivos están en 'resources/server'
-    const isProd = process.env.NODE_ENV === 'production';
-    const basePath = isProd 
-        ? path.join(process.resourcesPath, 'server') 
-        : __dirname;
+    // Envolvemos TODO en un setImmediate inicial. 
+    // Esto hace que Electron registre el clic y libere el hilo de la UI 
+    // ANTES de siquiera mirar el caché o los archivos.
+    setImmediate(() => {
+        try {
+            if (res.writableEnded) return;
 
-    const ytDlpPath = path.join(basePath, 'yt-dlp.exe');
-    const denoPath = path.join(basePath, 'deno.exe');
-    const cookiesPath = path.join(basePath, 'cookies.txt');
-    
-    // Verificación de seguridad (opcional para debug)
-    if (!fs.existsSync(ytDlpPath)) {
-        console.error(`❌ No se encontró yt-dlp en: ${ytDlpPath}`);
-    }
+            // 1. INTENTAR CACHÉ RÁPIDO
+            if (urlCache.has(id)) {
+                const cached = urlCache.get(id);
+                if (Date.now() < cached.expires) {
+                    console.log(`🚀 [Cache Hit] Sirviendo desde Google: ${id}`);
+                    return streamFromGoogle(cached.url, res, req, id);
+                } else {
+                    urlCache.delete(id);
+                }
+            }
 
-    if (urlCache.has(id)) {
-        const cached = urlCache.get(id);
-        if (Date.now() < cached.expires) {
-            return streamFromGoogle(cached.url, res, req);
-        }
-    }
+            // 2. PRIORIDAD MÁXIMA: STREAM DIRECTO (Bypass)
+            // Si no hay caché, lanzamos el pipe. 
+            // El log nos confirmará si aquí es donde se produce el retraso.
+            console.log(`⚡ [Cache MISS] Lanzando Fallback Pipe: ${id}`);
+            fallbackPipe(id, res, req);
 
-    const ytDlp = spawn(ytDlpPath, [
-        '-g', `https://www.youtube.com/watch?v=${id}`,
-        '-f', '251',
-        '-f', 'bestaudio', // Fallback si 251 no existe
-        '--cookies', cookiesPath,
-        '--js-runtimes', `deno:${denoPath}`,
-        '--no-check-formats', '--no-warning', '--no-check-certificate'
-    ]);
+            // 3. SEGUNDO PLANO (CACHÉ SILENCIOSO)
+            // Retrasamos la extracción 3 segundos para que no compita con el arranque del audio
+            setTimeout(() => {
+                getYoutubeUrl(id)
+                    .then(() => console.log(`✅ [Background Cache] Guardado: ${id}`))
+                    .catch(() => {}); // Ignoramos errores en segundo plano
+            }, 3000);
 
-    let urlData = '';
-    ytDlp.stdout.on('data', (data) => { urlData += data.toString(); });
-    
-    ytDlp.on('error', (err) => {
-        console.error("❌ Error al ejecutar yt-dlp:", err);
-        if (!res.headersSent) res.status(500).send("Error interno del motor de streaming");
-    });
-
-    ytDlp.on('close', (code) => {
-        if (code === 0 && urlData.trim()) {
-            const finalUrl = urlData.trim();
-            urlCache.set(id, { url: finalUrl, expires: Date.now() + (5 * 60 * 60 * 1000) });
-            streamFromGoogle(finalUrl, res, req);
-        } else {
-            if (!res.headersSent) res.status(500).send("Error en la extracción del audio");
+        } catch (err) {
+            console.error("❌ Error en el hilo de stream:", err);
+            if (!res.headersSent) res.status(500).end();
         }
     });
 });
 
-function streamFromGoogle(url, res, req) {
+function streamFromGoogle(url, res, req, id) {
     const headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36'
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Connection': 'keep-alive'
     };
+    
+    if (req.headers.range) headers['Range'] = req.headers.range;
 
-    if (req.headers.range) {
-        headers['Range'] = req.headers.range;
-    }
+    const request = https.get(url, { 
+        headers, 
+        agent: httpsAgent, 
+        timeout: 5000 // Bajamos a 5s para que el fallback actúe rápido si Google no responde
+    }, (proxyRes) => {
+        // 1. Detectar enlaces rotos de YouTube (403 Forbidden o 410 Gone)
+        if (proxyRes.statusCode === 403 || proxyRes.statusCode === 410) {
+            urlCache.delete(id);
+            console.log(`🔄 URL caducada/bloqueada para ${id}, activando fallback...`);
+            return fallbackPipe(id, res, req);
+        }
 
-    https.get(url, { headers }, (proxyRes) => {
-        res.status(proxyRes.statusCode);
+        // 2. Configurar cabeceras de respuesta
+        // Eliminamos las cabeceras originales de Google que puedan causar conflictos de seguridad
+        const cleanHeaders = { ...proxyRes.headers };
+        delete cleanHeaders['content-security-policy'];
+        delete cleanHeaders['x-frame-options'];
 
-        const responseHeaders = {
+        res.writeHead(proxyRes.statusCode, {
+            ...cleanHeaders,
             'Content-Type': 'audio/webm',
-            'Accept-Ranges': 'bytes',
             'Access-Control-Allow-Origin': '*',
-        };
+            'Cache-Control': 'no-cache' // En streaming mejor no cachear en el navegador para evitar lag
+        });
 
-        if (proxyRes.headers['content-range']) {
-            responseHeaders['Content-Range'] = proxyRes.headers['content-range'];
-        }
-        if (proxyRes.headers['content-length']) {
-            responseHeaders['Content-Length'] = proxyRes.headers['content-length'];
-        }
-
-        res.set(responseHeaders);
+        // 3. Flujo de datos
         proxyRes.pipe(res);
-    }).on('error', (e) => {
-        console.error("❌ Error en proxy de audio:", e.message);
-        if (!res.headersSent) res.status(500).send("Error de audio");
+
+        // Si la conexión con Google se corta a la mitad, intentamos salvar con el pipe
+        proxyRes.on('error', () => {
+            if (!res.writableEnded) fallbackPipe(id, res, req);
+        });
+
+    });
+
+    // Manejo de errores de conexión inicial o Timeout
+    request.on('error', (err) => {
+        console.log(`⚠️ Google Stream Error (${err.message}). Saltando a Fallback.`);
+        if (!res.writableEnded) fallbackPipe(id, res, req);
+    });
+
+    request.on('timeout', () => {
+        request.destroy(); // Abortamos la petición lenta
+        console.log(`⏳ Timeout en Google Stream para ${id}`);
     });
 }
 
-// --- 4. MOTOR DE LETRAS AUTOMÁTICAS ---
+let activeStreams = 0;
+const MAX_STREAMS = 2; // Solo permitimos 2 canciones procesándose a la vez
+
+function fallbackPipe(id, res, req) {
+    // Si ya hay demasiados procesos, cancelamos este para salvar la UI
+    if (activeStreams >= MAX_STREAMS) {
+        console.warn("⚠️ Máximo de procesos alcanzado. Cancelando stream.");
+        if (!res.headersSent) res.status(429).send("Servidor ocupado");
+        return;
+    }
+
+    activeStreams++;
+    const ytDlpPath = path.join(basePath, 'yt-dlp.exe');
+    const cookiesPath = path.join(basePath, 'cookies.txt');
+
+    const args = [
+        `https://www.youtube.com/watch?v=${id}`, 
+        '-f', '251/bestaudio', 
+        '-o', '-', 
+        '--quiet', 
+        '--no-playlist',
+        '--force-ipv4',
+        '--buffer-size', '64K'
+    ];
+
+    if (fs.existsSync(cookiesPath)) args.push('--cookies', cookiesPath);
+
+    const proc = spawn(ytDlpPath, args, { 
+        windowsHide: true,
+        detached: false, // Mantenerlo unido para que muera con la app
+        stdio: ['ignore', 'pipe', 'ignore'], // Evita que los logs de error bloqueen el buffer
+        priority: 0 // Prioridad normal para no asfixiar a Electron
+    });
+
+    // Muy importante: no bloquees el flujo esperando eventos de escritura
+    proc.stdout.on('error', () => {
+        if (!proc.killed) proc.kill();
+    });
+
+    if (!res.headersSent) {
+        res.writeHead(200, {
+            'Content-Type': 'audio/webm',
+            'Access-Control-Allow-Origin': '*',
+            'Transfer-Encoding': 'chunked',
+            'Connection': 'keep-alive'
+        });
+    }
+
+    proc.stdout.pipe(res);
+
+    // Limpieza total al terminar o error
+    const cleanup = () => {
+        if (!proc.killed) {
+            proc.kill('SIGKILL');
+            activeStreams = Math.max(0, activeStreams - 1);
+            console.log(`♻️ Proceso liberado para ${id}. Activos: ${activeStreams}`);
+        }
+    };
+
+    // Si el usuario cambia de canción o cierra la app, matamos el proceso YA
+    req.on('close', cleanup);
+    proc.on('close', cleanup);
+    proc.on('error', cleanup);
+
+    // Captura de errores para que el servidor no muera (Error 500)
+    proc.stderr.on('data', (data) => {
+        if (data.toString().includes('ERROR')) {
+            console.error(`[yt-dlp error]: ${data}`);
+            if (!res.writableEnded) res.end();
+        }
+    });
+}
+
+// --- 6. LETRAS, BÚSQUEDA Y RADIO ---
 app.get('/api/lyrics', async (req, res) => {
     let { id, q } = req.query;
-
     try {
-        let response = await axios.get(`https://lrclib.net/api/get?youtube_id=${id}`, {
-            headers: { 'User-Agent': 'KlangMusic/1.0' },
-            timeout: 3000
-        }).catch(() => null);
-
-        if (!response?.data && (!q || q.trim() === "")) {
-            const trackInfo = await ytmusic.getSong(id).catch(() => null);
-            if (trackInfo) {
-                q = `${trackInfo.name} ${trackInfo.artist?.name || ''}`;
-            }
-        }
-
+        let response = await axios.get(`https://lrclib.net/api/get?youtube_id=${id}`, { timeout: 3000 }).catch(() => null);
         if (!response?.data && q) {
-            const searchRes = await axios.get(`https://lrclib.net/api/search?q=${encodeURIComponent(q)}`, {
-                headers: { 'User-Agent': 'KlangMusic/1.0' }
-            });
-            if (searchRes.data?.length > 0) {
-                response = { data: searchRes.data.find(s => s.syncedLyrics) || searchRes.data[0] };
-            }
+            const searchRes = await axios.get(`https://lrclib.net/api/search?q=${encodeURIComponent(q)}`);
+            if (searchRes.data?.length > 0) response = { data: searchRes.data[0] };
         }
-
-        if (response?.data) {
-            const lyrics = response.data.syncedLyrics || response.data.plainLyrics;
-            return res.json({ lyrics });
-        }
-
-        res.status(404).json({ error: "Letra no encontrada" });
-
-    } catch (error) {
-        console.error("❌ Error:", error.message);
-        res.status(500).json({ error: "Error interno" });
-    }
+        res.json({ lyrics: response?.data?.syncedLyrics || response?.data?.plainLyrics || null });
+    } catch (e) { res.status(500).json({ error: "Error" }); }
 });
 
-// --- 5. BÚSQUEDA (YOUTUBE MUSIC PRO) ---
 app.get('/api/search', async (req, res) => {
     try {
-        const { q: query, type = 'songs' } = req.query;
-        if (!query) return res.json([]);
-
+        const { q, type = 'songs' } = req.query;
+        if (!q) return res.json([]);
         let results = [];
-        if (type === 'albums') results = await ytmusic.searchAlbums(query);
-        else if (type === 'artists') results = await ytmusic.searchArtists(query);
-        else results = await ytmusic.searchSongs(query);
+        if (type === 'albums') results = await ytmusic.searchAlbums(q);
+        else if (type === 'artists') results = await ytmusic.searchArtists(q);
+        else results = await ytmusic.searchSongs(q);
 
-        const cleanResults = results.map(item => {
-            const getBestArtistName = (s) => {
-                if (type === 'artists') return s.name || "Artista desconocido";
-                if (Array.isArray(s.artists) && s.artists.length > 0) {
-                    return s.artists[0].name || s.artists[0].author || "Artista desconocido";
-                }
-                if (s.artist) {
-                    if (Array.isArray(s.artist) && s.artist.length > 0) return s.artist[0].name;
-                    if (typeof s.artist === 'string') return s.artist;
-                    if (typeof s.artist === 'object') return s.artist.name;
-                }
-                if (s.author) {
-                    return typeof s.author === 'string' ? s.author : (s.author.name || "Artista desconocido");
-                }
-                return "Artista desconocido";
-            };
-
-            return {
-                youtubeId: item.videoId || item.albumId || item.browseId,
-                title: item.name || item.title,
-                artist: getBestArtistName(item),
-                album: (item.album && typeof item.album === 'object') ? item.album.name : (item.album || "Single"),
-                thumbnail: item.thumbnails && item.thumbnails.length > 0 
-                    ? item.thumbnails[item.thumbnails.length - 1].url 
-                    : "https://via.placeholder.com/150",
-                duration: item.duration,
-                type: type
-            };
-        });
-        res.json(cleanResults);
-    } catch (e) {
-        res.status(500).json({ error: "Error en el motor" });
-    }
+        res.json(results.map(item => ({
+            youtubeId: item.videoId || item.albumId || item.browseId,
+            title: item.name || item.title,
+            artist: item.artists?.[0]?.name || "Artista",
+            thumbnail: item.thumbnails?.[item.thumbnails.length - 1]?.url,
+            type
+        })));
+    } catch (e) { res.status(500).json({ error: "Error" }); }
 });
 
-// --- 6. RADIO Y ARTISTA ---
 app.get('/api/radio', async (req, res) => {
     try {
-        const suggestions = await getSuggestions(req.query.videoId);
-        res.json(suggestions.map(s => ({
-            youtubeId: s.youtubeId,
-            title: s.title,
-            artist: s.artist?.name || s.artist,
-            thumbnail: s.thumbnailUrl || s.thumbnail
-        })));
+        const s = await getSuggestions(req.query.videoId);
+        res.json(s.map(i => ({ youtubeId: i.youtubeId, title: i.title, artist: i.artist?.name || i.artist, thumbnail: i.thumbnailUrl })));
     } catch (e) { res.json([]); }
 });
 
-app.get('/api/artist/:id', async (req, res) => {
-    try {
-        const data = await getArtistURL(req.params.id);
-        res.json(data);
-    } catch(e) { res.status(500).send("Error"); }
-});
-
-// --- 7. SINCRONIZACIÓN DISCORD ---
+// --- 7. SYNC ---
 app.post('/api/sync/save', async (req, res) => {
-    const { userId, data } = req.body; 
-    if (!userId || !data.song) return res.status(400).json({ error: "Faltan datos" });
-
     try {
         const channel = await client.channels.fetch(process.env.DB_CHANNEL_ID);
-        const embed = {
-            title: `🎵 Nueva Canción Guardada`,
-            description: `**${data.song.title}**\n${data.song.artist}`,
-            thumbnail: { url: data.song.thumbnail },
-            color: 0x5865F2,
-            footer: { text: "Klang Music Cloud Sync" }
-        };
-        await channel.send({ 
-            content: `DATA_SYNC::${userId}::${data.song.youtubeId}`,
-            embeds: [embed] 
-        });
+        await channel.send({ content: `DATA_SYNC::${req.body.userId}::${req.body.data.song.youtubeId}` });
         res.json({ success: true });
-    } catch (error) {
-        res.status(500).json({ error: "Error de sincronización" });
-    }
+    } catch (error) { res.status(500).json({ error: "Error Sync" }); }
 });
 
 app.get('/api/sync/load/:userId', async (req, res) => {
-    const { userId } = req.params;
     try {
         const channel = await client.channels.fetch(process.env.DB_CHANNEL_ID);
-        const messages = await channel.messages.fetch({ limit: 100 });
-        const userSongs = messages
-            .filter(m => m.content.startsWith(`DATA_SYNC::${userId}`))
-            .map(m => {
-                const embed = m.embeds[0];
-                if (!embed) return null;
-                return {
-                    title: embed.title.replace('🎵 ', ''),
-                    artist: embed.description.split('\n')[0].replace('**', ''),
-                    thumbnail: embed.thumbnail?.url,
-                    youtubeId: m.content.split('::')[2]
-                };
-            })
-            .filter(Boolean);
-        res.json(userSongs);
-    } catch (error) {
-        res.status(500).json({ error: "Error al cargar datos" });
-    }
+        const messages = await channel.messages.fetch({ limit: 50 });
+        const songs = messages
+            .filter(m => m.content.startsWith(`DATA_SYNC::${req.params.userId}`))
+            .map(m => ({ youtubeId: m.content.split('::')[2] }));
+        res.json(songs);
+    } catch (error) { res.status(500).json({ error: "Error Load" }); }
 });
 
-// --- 8. LANZAMIENTO ---
+// --- 8. INICIO ---
 const start = async () => {
-    try {
-        console.log("⏳ Inicializando YouTube Music...");
-        await Promise.race([
-            ytmusic.initialize(),
-            new Promise((_, reject) => setTimeout(() => reject(new Error("Timeout YT")), 5000))
-        ]).catch(err => console.warn("⚠️ YT Music no pudo iniciar, pero el servidor seguirá arrancando."));
-
-        app.listen(PORT, () => {
-            console.log(`🚀 Servidor Klang activo en http://localhost:${PORT}`);
-        });
-    } catch (err) {
-        console.error("❌ Error durante el inicio, forzando arranque local:", err);
-        app.listen(PORT, () => {
-            console.log(`🚀 Servidor Klang arrancado en MODO EMERGENCIA (Puerto ${PORT})`);
-        });
+    // Verificar si yt-dlp existe antes de abrir el puerto
+    const ytPath = path.join(basePath, 'yt-dlp.exe');
+    if (!fs.existsSync(ytPath)) {
+        console.error(`🚨 ERROR CRÍTICO: No se encontró yt-dlp.exe en ${ytPath}`);
+        // Log al archivo de crash para que lo veas en el escritorio
+        fs.appendFileSync(path.join(userDataPath, 'crash_log.txt'), `🚨 Binario no encontrado en: ${ytPath}\n`);
     }
+
+    const server = app.listen(PORT, '0.0.0.0', () => {
+        console.log(`🚀 Servidor Klang activo en puerto ${PORT}`);
+    });
+    
+    server.on('error', (e) => console.error("❌ Error Server:", e.code));
+
+    try {
+        ytmusic.initialize().catch(() => {});
+    } catch (err) {}
 };
 
+process.on('uncaughtException', (err) => {
+    // Esto creará un archivo .txt en la carpeta de la app si el servidor se rompe
+    fs.appendFileSync(path.join(userDataPath, 'crash_log.txt'), 
+    `[${new Date().toLocaleString()}] CRASH: ${err.message}\n${err.stack}\n\n`);
+});
+
+process.on('SIGTERM', () => {
+  console.log('Cerrando servidor...');
+  process.exit(0);
+});
+
 start();
+

@@ -1,7 +1,7 @@
 {
   "name": "klang-app",
-  "version": "1.0.3",
-  "description": "Klang - Early Access (Local Port Edition)",
+  "version": "1.0.4",
+  "description": "Klang Early Access",
   "author": "PuchitoGameDev",
   "main": "main.js",
   "type": "commonjs",
@@ -14,7 +14,7 @@
     "build": "vite build && node fix-paths.js",
     "preview": "vite preview",
     "electron": "electron .",
-    "dist": "npm run build && electron-builder --win --x64",
+    "dist": "taskkill /F /IM \"Klang Early Access.exe\" /T || echo App_no_running && npm run build && electron-builder --win --x64",
     "dist:clean": "rd /s /q dist release && npm run build && electron-builder --win --x64",
     "publish": "npm run build && electron-builder --win --x64 --publish always"
   },
@@ -44,12 +44,6 @@
     "appId": "com.klang.app",
     "productName": "Klang Early Access",
     "asar": true,
-    "asarUnpack": [
-      "server/**/*"
-    ],
-    "directories": {
-      "output": "release"
-    },
     "publish": [
       {
         "provider": "github",
@@ -57,45 +51,32 @@
         "repo": "KLANG"
       }
     ],
-    "win": {
-      "target": "nsis",
-      "requestedExecutionLevel": "asInvoker",
-      "icon": "public/icon.ico"
-    },
-    "nsis": {
-      "oneClick": false,
-      "allowToChangeInstallationDirectory": true,
-      "artifactName": "Klang_Alpha_Test_${version}.${ext}"
+    "asarUnpack": [
+      "server/yt-dlp.exe",
+      "server/deno.exe",
+      "server/cookies.txt"
+    ],
+    "directories": {
+      "output": "release"
     },
     "files": [
       "dist/**/*",
       "main.js",
       "package.json",
-      "server/**/*",
-      "node_modules/**/*"
+      "server/**/*"
     ],
-    "extraResources": [
-      {
-        "from": "public",
-        "to": "public",
-        "filter": [
-          "**/*"
-        ]
-      },
-      {
-        "from": "server",
-        "to": "server",
-        "filter": [
-          "**/*"
-        ]
-      },
-      {
-        "from": "node_modules",
-        "to": "node_modules",
-        "filter": [
-          "**/*"
-        ]
-      }
-    ]
+    "win": {
+      "target": "nsis",
+      "requestedExecutionLevel": "asInvoker",
+      "icon": "public/icon.ico",
+      "publish": [
+        "github"
+      ]
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "artifactName": "${productName}-Setup-${version}.${ext}"
+    }
   }
 }

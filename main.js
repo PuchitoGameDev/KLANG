@@ -1,48 +1,89 @@
 const { app, BrowserWindow, ipcMain, globalShortcut, dialog } = require('electron');
 const path = require('path');
 const isDev = require('electron-is-dev');
-const { fork } = require('child_process');
 const { autoUpdater } = require('electron-updater');
+const { fork } = require('child_process');
 
 let mainWindow;
-let serverProcess; // Variable para controlar el proceso del servidor
+let serverProcess;
 
-// --- CONFIGURACIÓN DE AUTO-UPDATES ---
+// --- CARGA DEL SERVIDOR (PROCESO INDEPENDIENTE) ---
+function startServer() {
+    try {
+        process.env.NODE_ENV = isDev ? 'development' : 'production';
+        
+        // En lugar de require, usamos fork para crear un hilo separado
+        // Esto evita que el servidor congele la interfaz de la app
+        const serverPath = path.join(__dirname, 'server', 'index.js');
+        
+        serverProcess = fork(serverPath, [], {
+            env: { ...process.env },
+            stdio: 'inherit' 
+        });
+
+        console.log("⏳ Motor del servidor iniciado en proceso independiente...");
+
+        serverProcess.on('error', (err) => {
+            console.error("❌ Error en el proceso del servidor:", err);
+        });
+
+        serverProcess.on('exit', (code) => {
+            console.log(`Child process exited with code ${code}`);
+            // Opcional: Reiniciar si el servidor se cae
+            if (code !== 0 && code !== null) {
+                setTimeout(startServer, 5000);
+            }
+        });
+    } catch (e) {
+        console.error("Error lanzando el servidor:", e);
+    }
+}
+
+// --- CONFIGURACIÓN DE AUTO-UPDATES REFORZADA ---
 autoUpdater.autoDownload = true;
 autoUpdater.autoInstallOnAppQuit = true;
+autoUpdater.allowPrerelease = false;
 
-function startServer() {
-  // Intentamos buscar el servidor en las dos ubicaciones posibles de Electron
-  const pathsToTry = [
-    path.join(__dirname, 'server', 'index.js'), // Modo Desarrollo o empaquetado ASAR
-    path.join(process.resourcesPath, 'app', 'server', 'index.js'), // Alternativa de empaquetado
-    path.join(process.resourcesPath, 'server', 'index.js') // Modo extraResources
-  ];
+function setupAutoUpdater() {
+    // Verificación periódica cada hora
+    setInterval(() => {
+        if (!isDev) autoUpdater.checkForUpdates();
+    }, 1000 * 60 * 60);
 
-  let serverPath = null;
-  const fs = require('fs');
+    autoUpdater.on('checking-for-update', () => {
+        console.log('🔍 Klang: Buscando actualizaciones...');
+    });
 
-  for (const p of pathsToTry) {
-    if (fs.existsSync(p)) {
-      serverPath = p;
-      break;
-    }
-  }
+    autoUpdater.on('update-available', (info) => {
+        console.log(`✨ Nueva versión encontrada: ${info.version}. Descargando...`);
+        if (mainWindow) {
+            mainWindow.webContents.send('terminal-log', `Actualización disponible: ${info.version}`);
+        }
+    });
 
-  if (!serverPath) {
-    console.error('CRÍTICO: No se encontró el archivo del servidor en ninguna ruta.');
-    return;
-  }
+    autoUpdater.on('download-progress', (progressObj) => {
+        console.log(`Descargando: ${progressObj.percent.toFixed(2)}%`);
+    });
 
-  serverProcess = fork(serverPath, [], {
-    env: { 
-      NODE_ENV: 'production',
-      PORT: 5002
-    },
-    stdio: 'inherit' // Esto hará que los errores del servidor salgan en tu consola
-  });
+    autoUpdater.on('update-downloaded', (info) => {
+        console.log('✅ Actualización descargada y lista.');
+        dialog.showMessageBox(mainWindow, {
+            type: 'question',
+            title: 'Klang Cloud - Actualización Lista',
+            message: `La versión ${info.version} ha sido descargada. ¿Quieres reiniciar Klang ahora para actualizar?`,
+            buttons: ['Reiniciar y Actualizar', 'Más tarde'],
+            defaultId: 0,
+            cancelId: 1
+        }).then((result) => {
+            if (result.response === 0) {
+                setImmediate(() => autoUpdater.quitAndInstall());
+            }
+        });
+    });
 
-  serverProcess.on('error', (err) => console.error('Error en proceso servidor:', err));
+    autoUpdater.on('error', (err) => {
+        console.error('❌ Error en el Auto-Updater:', err);
+    });
 }
 
 function createWindow() {
@@ -55,8 +96,10 @@ function createWindow() {
     backgroundColor: '#09090b',
     webPreferences: {
       nodeIntegration: true,
+      backgroundThrottling: false, // Vital para que no se congele al cambiar de ventana
       contextIsolation: false, // Permite que React use ipcRenderer directamente
       webSecurity: false,      // Permite cargar música y recursos locales sin CORS
+      offscreen: false
     },
   });
 
@@ -120,25 +163,16 @@ ipcMain.on('window-close', () => {
   if (mainWindow) mainWindow.close();
 });
 
-// --- EVENTOS DE ACTUALIZACIÓN ---
-autoUpdater.on('update-available', () => {
-  console.log('Actualización disponible encontrada.');
-});
-
-autoUpdater.on('update-downloaded', (info) => {
-  dialog.showMessageBox({
-    type: 'info',
-    title: 'Actualización lista',
-    message: `La versión ${info.version} ha sido descargada. ¿Quieres reiniciar ahora para actualizar?`,
-    buttons: ['Reiniciar', 'Más tarde']
-  }).then((result) => {
-    if (result.response === 0) autoUpdater.quitAndInstall();
-  });
-});
-
+// --- INICIO DE APLICACIÓN ---
 app.whenReady().then(() => {
-  startServer(); // Primero el servidor
-  createWindow(); // Luego la interfaz
+  // Iniciamos el servidor en su propio proceso antes de crear la ventana
+  startServer();
+  
+  // Pequeño retraso para la creación de ventana para asegurar fluidez
+  setTimeout(createWindow, 200); 
+
+  // Configurar y ejecutar el updater
+  setupAutoUpdater();
 
   if (!isDev) {
     autoUpdater.checkForUpdatesAndNotify();
@@ -151,10 +185,12 @@ app.whenReady().then(() => {
 
 app.on('will-quit', () => {
   globalShortcut.unregisterAll();
+  // Matamos el proceso del servidor al salir
+  if (serverProcess) serverProcess.kill();
 });
 
 app.on('window-all-closed', () => {
-  // Matamos el proceso del servidor al cerrar la app
-  if (serverProcess) serverProcess.kill();
-  if (process.platform !== 'darwin') app.quit();
+    if (process.platform !== 'darwin') {
+        app.quit();
+    }
 });
